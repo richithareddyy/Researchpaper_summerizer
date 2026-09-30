@@ -317,7 +317,10 @@ def get_api_key():
 
 @st.cache_resource(show_spinner=False)
 def get_client(api_key):
-    return genai.Client(api_key=api_key)
+    # Retry temporary failures (rate limits, overloaded models) with exponential backoff
+    retry = types.HttpRetryOptions(attempts=4, initial_delay=2, max_delay=20,
+                                   http_status_codes=[429, 500, 502, 503, 504])
+    return genai.Client(api_key=api_key, http_options=types.HttpOptions(retry_options=retry))
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -342,6 +345,9 @@ def _describe_api_error(error):
         return f"The selected model is not available: {message}. Choose a different model in the sidebar."
     if code == 429:
         return "The Gemini API quota or rate limit was reached. Wait a moment and try again."
+    if code in (500, 502, 503, 504):
+        return ("The selected Gemini model is busy right now (a temporary problem on Google's side). "
+                "Try again in a minute, or pick a different model in the sidebar.")
     return f"Gemini API error ({code}): {message}"
 
 
@@ -936,6 +942,8 @@ def render_sidebar():
     api_key = get_api_key()
     if not api_key:
         st.sidebar.warning("No API key found. AI features are disabled until a key is provided.")
+    elif not st.session_state.get("api_key_input"):
+        st.sidebar.success("API key loaded automatically. No need to enter it here.")
 
     # Model selection
     models = []
