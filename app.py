@@ -1,3 +1,4 @@
+import csv
 import hashlib
 import io
 import json
@@ -60,6 +61,16 @@ ANALYSIS_OPTIONS = {
     "Generate Citation Graph": None,
 }
 
+CITATION_STYLES = ["APA", "MLA", "BibTeX"]
+NAME_PARTICLES = {"van", "von", "de", "der", "den", "da", "di", "del", "la", "le", "du", "dos", "das", "bin", "al"}
+
+CHAT_HISTORY_TURNS = 6  # earlier exchanges sent with each question for context
+CHAT_STARTERS = [
+    "What problem does this paper solve?",
+    "What are the main results?",
+    "What are the limitations?",
+]
+
 SAMPLE_PAPER = {"arxiv_id": "1706.03762", "label": "Attention Is All You Need (2017)"}
 
 COMPARISON_FOCUS = {
@@ -92,6 +103,8 @@ SESSION_DEFAULTS = {
     "analyses": {},
     "follow_up_questions": "",
     "comparison": "",
+    "chat_messages": [],
+    "study_aids": None,
     "last_upload_id": None,
     "paper_cache": {},
 }
@@ -567,6 +580,20 @@ def generate_follow_up_questions(text, model_name=DEFAULT_MODEL):
     return call_gemini(prompt, model_name)
 
 
+def _parse_json_object(raw, what):
+    """Parse a JSON object from a model response, tolerating code fences."""
+    raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw.strip())
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise GeminiError(f"The model did not return valid {what} JSON. Please try again.") from e
+    if isinstance(data, list) and data:
+        data = data[0]
+    if not isinstance(data, dict):
+        raise GeminiError(f"The model did not return a {what} object. Please try again.")
+    return data
+
+
 def extract_paper_details(text, model_name=DEFAULT_MODEL):
     """Extract structured metadata from the beginning of the paper using Gemini"""
     prompt = f"""
@@ -587,16 +614,7 @@ def extract_paper_details(text, model_name=DEFAULT_MODEL):
     Use null or an empty array for anything that is not stated in the text.
     """
 
-    raw = call_gemini(prompt, model_name, json_output=True)
-    raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw.strip())
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise GeminiError("The model did not return valid metadata JSON.") from e
-    if isinstance(data, list) and data:
-        data = data[0]
-    if not isinstance(data, dict):
-        raise GeminiError("The model did not return a metadata object.")
+    data = _parse_json_object(call_gemini(prompt, model_name, json_output=True), "metadata")
 
     year = data.get("publication_year")
     try:
@@ -656,6 +674,165 @@ def compare_papers(papers_text, model_name=DEFAULT_MODEL, comparison_type="Full 
     return call_gemini(prompt, model_name)
 
 
+def answer_question(text, question, chat_history, model_name=DEFAULT_MODEL):
+    """Answer a question about the paper, using recent chat turns as context"""
+    text, _ = prepare_text_for_model(text)
+    recent = chat_history[-CHAT_HISTORY_TURNS * 2:]
+    transcript = "\n\n".join(
+        f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}" for m in recent
+    ) or "(no earlier messages)"
+
+    prompt = f"""
+    You are a research assistant answering questions about the research paper below.
+    Base your answer on the paper. If the paper does not contain the answer, say so clearly;
+    you may then add brief general context, labelled as coming from outside the paper.
+    Be concise and use Markdown where it helps.
+
+    <paper>
+    {text}
+    </paper>
+
+    <conversation>
+    {transcript}
+    </conversation>
+
+    Question: {question}
+    """
+
+    return call_gemini(prompt, model_name)
+
+
+def generate_study_aids(text, model_name=DEFAULT_MODEL):
+    """Create a glossary of key terms and flashcards from the paper"""
+    text, _ = prepare_text_for_model(text)
+
+    prompt = f"""
+    Create study aids for a student reading the following research paper:
+
+    <paper>
+    {text}
+    </paper>
+
+    Return a JSON object with:
+    - glossary: 10 to 12 objects with "term" and "definition". Pick the terms a reader must
+      understand; define each in one or two plain sentences, as it is used in this paper.
+    - flashcards: 8 to 10 objects with "question" and "answer" that test understanding of the
+      paper's problem, method, results, and limitations. Keep answers to one to three sentences.
+    """
+
+    data = _parse_json_object(call_gemini(prompt, model_name, json_output=True), "study aids")
+
+    def clean(items, first, second):
+        pairs = []
+        for item in items if isinstance(items, list) else []:
+            if isinstance(item, dict):
+                a, b = str(item.get(first) or "").strip(), str(item.get(second) or "").strip()
+                if a and b:
+                    pairs.append({first: a, second: b})
+        return pairs
+
+    aids = {
+        "glossary": clean(data.get("glossary"), "term", "definition"),
+        "flashcards": clean(data.get("flashcards"), "question", "answer"),
+    }
+    if not aids["glossary"] and not aids["flashcards"]:
+        raise GeminiError("The model did not return usable study aids. Please try again.")
+    return aids
+
+
+def flashcards_to_csv(flashcards):
+    """Question,answer rows (no header) that flashcard apps such as Anki can import."""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    for card in flashcards:
+        writer.writerow([card["question"], card["answer"]])
+    return buffer.getvalue()
+
+
+# Citations
+def _split_name(name):
+    """Return (last, first) for 'First Last' or 'Last, First'."""
+    name = re.sub(r'\s+', ' ', name).strip()
+    if "," in name:
+        last, first = (part.strip() for part in name.split(",", 1))
+        return last, first
+    parts = name.split(" ")
+    if len(parts) == 1:
+        return parts[0], ""
+    i = len(parts) - 1
+    while i > 1 and parts[i - 1].lower() in NAME_PARTICLES:  # keep "van der" with the surname
+        i -= 1
+    return " ".join(parts[i:]), " ".join(parts[:i])
+
+
+def _initials(first):
+    initials = []
+    for part in first.replace(".", ". ").split():
+        pieces = [p for p in part.split("-") if p and p[0].isalpha()]
+        if pieces:
+            initials.append("-".join(f"{p[0].upper()}." for p in pieces))
+    return " ".join(initials)
+
+
+def format_citation(metadata, style):
+    """Format the paper's metadata as an APA, MLA, or BibTeX citation."""
+    authors = metadata.get("authors") or []
+    if isinstance(authors, str):
+        authors = [authors]
+    names = [_split_name(a) for a in authors if a and a.strip()]
+    title = (metadata.get("title") or "Untitled").strip().rstrip(".")
+    year = metadata.get("publication_year")
+    venue = metadata.get("journal_or_conference")
+    doi = metadata.get("doi")
+    doi_url = f"https://doi.org/{doi}" if doi else ""
+
+    if style == "APA":
+        formatted = [f"{last}, {_initials(first)}" if first else last for last, first in names]
+        if len(formatted) > 20:
+            author_text = ", ".join(formatted[:19]) + ", ... " + formatted[-1]
+        elif len(formatted) > 1:
+            author_text = ", ".join(formatted[:-1]) + ", & " + formatted[-1]
+        else:
+            author_text = formatted[0] if formatted else ""
+        year_text = f"({year})" if year else "(n.d.)"
+        parts = [f"{author_text} {year_text}. {title}." if author_text else f"{title}. {year_text}."]
+        if venue:
+            parts.append(f"{venue}.")
+        if doi_url:
+            parts.append(doi_url)
+        return " ".join(parts)
+
+    if style == "MLA":
+        if len(names) == 1:
+            author_text = f"{names[0][0]}, {names[0][1]}".rstrip(", ")
+        elif len(names) == 2:
+            author_text = f"{names[0][0]}, {names[0][1]}, and {names[1][1]} {names[1][0]}".replace(" ,", ",").strip()
+        elif names:
+            author_text = f"{names[0][0]}, {names[0][1]}, et al".rstrip(", ")
+        else:
+            author_text = ""
+        details = ", ".join(str(v) for v in (venue, year, doi_url) if v)
+        citation = f'{author_text.rstrip(".")}. "{title}."' if author_text else f'"{title}."'
+        return f"{citation} {details}." if details else citation
+
+    # BibTeX
+    first_author = re.sub(r'[^A-Za-z]', '', names[0][0]).lower() if names else "paper"
+    title_word = next((w.lower() for w in re.findall(r'[A-Za-z]+', title) if len(w) > 3), "")
+    key = f"{first_author}{year or ''}{title_word}"
+    entry_type = "article" if venue and "preprint" not in venue.lower() else "misc"
+    fields = [("title", f"{{{title}}}")]
+    if names:
+        fields.append(("author", " and ".join(f"{last}, {first}" if first else last for last, first in names)))
+    if year:
+        fields.append(("year", str(year)))
+    if venue:
+        fields.append(("journal" if entry_type == "article" else "howpublished", venue))
+    if doi:
+        fields.append(("doi", doi))
+    body = ",\n".join(f"  {name} = {{{value}}}" for name, value in fields)
+    return f"@{entry_type}{{{key},\n{body}\n}}"
+
+
 # Paper loading
 def build_paper(text, metadata, figures=None, tables=None, source=""):
     return {
@@ -713,6 +890,8 @@ def load_paper(paper):
     st.session_state.summary_info = paper.get("summary_info", "")
     st.session_state.analyses = dict(paper.get("analyses", {}))
     st.session_state.follow_up_questions = paper.get("follow_up_questions", "")
+    st.session_state.chat_messages = list(paper.get("chat_messages", []))
+    st.session_state.study_aids = paper.get("study_aids")
 
 
 def _http_headers(include_contact=True):
@@ -878,7 +1057,25 @@ def build_report_markdown():
         sections += [f"## {ANALYSIS_TYPES[analysis_type]} Analysis", _demote_headings(result)]
     if st.session_state.follow_up_questions:
         sections += ["## Follow-up Questions", _demote_headings(st.session_state.follow_up_questions)]
+    aids = st.session_state.study_aids
+    if aids and aids["glossary"]:
+        sections += ["## Glossary", "\n".join(f"- **{g['term']}**: {g['definition']}" for g in aids["glossary"])]
+    if aids and aids["flashcards"]:
+        sections += ["## Flashcards", "\n\n".join(
+            f"**Q{i}. {c['question']}**\n\n{c['answer']}" for i, c in enumerate(aids["flashcards"], 1))]
+    if st.session_state.chat_messages:
+        sections += ["## Questions & Answers", "\n\n".join(
+            f"**Q: {m['content']}**" if m["role"] == "user" else _demote_headings(m["content"])
+            for m in st.session_state.chat_messages)]
+    sections += ["## Citation", format_citation(metadata, "APA"),
+                 "```bibtex\n" + format_citation(metadata, "BibTeX") + "\n```"]
     return "\n\n".join(sections) + "\n"
+
+
+def has_results():
+    return bool(st.session_state.current_summary or st.session_state.analyses
+                or st.session_state.follow_up_questions or st.session_state.chat_messages
+                or st.session_state.study_aids)
 
 
 def markdown_to_pdf(markdown_text, title):
@@ -919,6 +1116,9 @@ def build_export_json():
         ],
         "analyses": st.session_state.analyses,
         "follow_up_questions": st.session_state.follow_up_questions,
+        "chat": st.session_state.chat_messages,
+        "study_aids": st.session_state.study_aids,
+        "citations": {style: format_citation(st.session_state.paper_metadata, style) for style in CITATION_STYLES},
         "references": st.session_state.references,
         "tables": st.session_state.tables,
         "export_date": datetime.now().isoformat()
@@ -1128,7 +1328,7 @@ def render_output_panel(model_option, summary_type, analysis_options):
         return
 
     # Tab-based interface for different outputs
-    tabs = st.tabs(["Summary", "Analysis", "Visualization", "Export"])
+    tabs = st.tabs(["Summary", "Chat", "Analysis", "Study", "Visualization", "Export"])
 
     # Summary Tab
     with tabs[0]:
@@ -1146,8 +1346,12 @@ def render_output_panel(model_option, summary_type, analysis_options):
             st.caption(st.session_state.summary_info)
             st.markdown(st.session_state.current_summary)
 
-    # Analysis Tab
+    # Chat Tab
     with tabs[1]:
+        render_chat(model_option)
+
+    # Analysis Tab
+    with tabs[2]:
         col1, col2 = st.columns(2)
 
         with col1:
@@ -1177,6 +1381,12 @@ def render_output_panel(model_option, summary_type, analysis_options):
                 else:
                     st.write("No keywords extracted")
 
+        # Citation
+        st.subheader("Cite This Paper")
+        style = st.radio("Citation style", CITATION_STYLES, horizontal=True, label_visibility="collapsed")
+        st.code(format_citation(st.session_state.paper_metadata, style), language=None, wrap_lines=True)
+        st.caption("Built from the extracted paper details. Use the copy icon, and double-check it before submitting.")
+
         # In-depth analyses
         available = [ANALYSIS_OPTIONS[o] for o in analysis_options if ANALYSIS_OPTIONS[o]]
         st.subheader("Detailed Analysis")
@@ -1205,8 +1415,12 @@ def render_output_panel(model_option, summary_type, analysis_options):
         if st.session_state.follow_up_questions:
             st.markdown(st.session_state.follow_up_questions)
 
+    # Study Tab
+    with tabs[3]:
+        render_study_aids(model_option)
+
     # Visualization Tab
-    with tabs[2]:
+    with tabs[4]:
         viz_options = [name for name, option in (("Keyword Cloud", "Extract Keywords"),
                                                  ("Citations by Year", "Generate Citation Graph"),
                                                  ("Figures & Tables", "Extract Figures & Tables"))
@@ -1271,11 +1485,11 @@ def render_output_panel(model_option, summary_type, analysis_options):
                 st.info("No tables detected in this document")
 
     # Export Tab
-    with tabs[3]:
+    with tabs[5]:
         st.subheader("Export Options")
 
-        if not st.session_state.current_summary:
-            st.info("Generate a summary first. Any analyses and follow-up questions you generate are included too.")
+        if not has_results():
+            st.info("Generate a summary, analysis, chat answer, or study aids first; everything you create is included.")
             return
 
         title = st.session_state.paper_metadata.get("title") or "Research Paper Summary"
@@ -1302,6 +1516,82 @@ def render_output_panel(model_option, summary_type, analysis_options):
             st.markdown(report)
 
 
+def _queue_question(question):
+    st.session_state.pending_question = question
+
+
+def _clear_chat():
+    st.session_state.chat_messages = []
+    _update_history()
+
+
+def render_chat(model_option):
+    """Ask questions about the paper in a chat"""
+    messages = st.session_state.chat_messages
+
+    if not messages:
+        st.caption("Ask anything about this paper. Answers are based on the paper's text.")
+        for question in CHAT_STARTERS:
+            st.button(question, on_click=_queue_question, args=(question,), key=f"starter_{question}")
+
+    for message in messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    question = st.chat_input("Ask a question about this paper")
+    question = question or st.session_state.pop("pending_question", None)
+    if question and question.strip():
+        question = question.strip()
+        with st.chat_message("user"):
+            st.markdown(question)
+        with st.chat_message("assistant"):
+            answer = run_ai_task("Reading the paper...", answer_question,
+                                 st.session_state.extracted_text, question, messages, model_option)
+        if answer:
+            st.session_state.chat_messages = messages + [
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": answer},
+            ]
+            _update_history()
+            st.rerun()
+
+    if messages:
+        st.button("Clear Chat", on_click=_clear_chat)
+
+
+def render_study_aids(model_option):
+    """Glossary and flashcards generated from the paper"""
+    aids = st.session_state.study_aids
+    label = "Regenerate Study Aids" if aids else "Generate Study Aids"
+    if st.button(label, type="secondary" if aids else "primary"):
+        result = run_ai_task("Creating a glossary and flashcards...", generate_study_aids,
+                             st.session_state.extracted_text, model_option)
+        if result:
+            st.session_state.study_aids = result
+            _update_history()
+            st.rerun()
+
+    if not aids:
+        st.caption("Creates a glossary of the paper's key terms and flashcards to test your understanding.")
+        return
+
+    if aids["glossary"]:
+        st.subheader(f"Glossary ({len(aids['glossary'])} terms)")
+        for item in aids["glossary"]:
+            st.markdown(f"**{item['term']}**: {item['definition']}")
+
+    if aids["flashcards"]:
+        st.subheader(f"Flashcards ({len(aids['flashcards'])})")
+        st.caption("Click a card to reveal the answer.")
+        for i, card in enumerate(aids["flashcards"], 1):
+            with st.expander(f"{i}. {card['question']}"):
+                st.markdown(card["answer"])
+        title = st.session_state.paper_metadata.get("title") or "paper"
+        st.download_button("Download Flashcards (CSV)", flashcards_to_csv(aids["flashcards"]),
+                           file_name=f"{safe_filename(title)}_flashcards.csv", mime="text/csv",
+                           on_click="ignore", help="Question and answer columns; imports into Anki and Quizlet.")
+
+
 def _update_history():
     """Save the current paper and its results to the session history"""
     entry = {
@@ -1316,6 +1606,8 @@ def _update_history():
         "summary_info": st.session_state.summary_info,
         "analyses": dict(st.session_state.analyses),
         "follow_up_questions": st.session_state.follow_up_questions,
+        "chat_messages": list(st.session_state.chat_messages),
+        "study_aids": st.session_state.study_aids,
         "timestamp": datetime.now().isoformat()
     }
 

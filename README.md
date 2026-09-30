@@ -30,11 +30,14 @@ Turn a PDF, pasted text or DOI/arXiv link into structured summaries, methodology
 - **Summaries**: comprehensive, executive, technical, critique, or "explain like I'm 5"
 - **Detailed analysis**: methodology, literature context, future research, and practical applications
 - **Follow-up questions**: research questions the paper raises
+- **Chat with the paper**: ask questions and get answers based on the paper's text, with starter questions to get going
+- **Study aids**: a glossary of key terms and flashcards, downloadable as CSV for Anki or Quizlet
+- **Citations**: copy-ready APA, MLA, and BibTeX citations built from the paper's details
 - **Metadata**: title, authors, year, venue, and DOI (from the PDF, Gemini, Crossref, or arXiv)
 - **Extraction**: references, embedded figures, and tables (via PyMuPDF table detection)
 - **Visualizations**: TF-IDF keywords, citations by year, and a figure/table gallery
 - **Paper comparison**: full, methodology-focused, or results-focused
-- **Export**: a report with the summary, analyses and questions, as Markdown, PDF, or JSON
+- **Export**: a report with the summary, analyses, questions, chat, study aids, and citation, as Markdown, PDF, or JSON
 - **History**: reopen the last 10 papers from this session, including their results
 
 Use **Advanced Analysis** in the sidebar to choose which analyses and visualizations appear.
