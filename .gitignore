@@ -1,0 +1,15 @@
+# Secrets
+.env
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Old export folder (exports are now served directly as downloads)
+downloads/
+
+# OS
+.DS_Store

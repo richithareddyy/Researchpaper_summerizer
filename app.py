@@ -1,344 +1,387 @@
-import streamlit as st
-import google.generativeai as genai
-import PyPDF2
+import hashlib
 import io
-import re
-import requests
-import base64
 import json
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-from dotenv import load_dotenv
 import os
-from io import BytesIO
-import tempfile
-from PIL import Image
-import fitz  # PyMuPDF
-import plotly.express as px
-import plotly.graph_objects as go
+import re
+import xml.etree.ElementTree as ET
 from datetime import datetime
-from pathlib import Path
+from urllib.parse import quote
+
+import markdown
+import pandas as pd
+import plotly.express as px
+import pymupdf
+import requests
+import streamlit as st
+from dotenv import load_dotenv
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 # Load environment variables
 load_dotenv()
 
-# Configure the Gemini API
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-genai.configure(api_key=GOOGLE_API_KEY)
+APP_TITLE = "Advanced Research Paper Summarizer"
+
+# Configuration (override any of these in .env)
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "400000"))
+MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", "50"))
+REQUEST_TIMEOUT = 30
+HISTORY_LIMIT = 10
+MIN_TEXT_CHARS = 200
+MIN_FIGURE_SIZE = 80  # px; smaller images are usually logos or icons
+MAX_FIGURES = 60
+
+SUMMARY_TYPES = {
+    "comprehensive": "Comprehensive",
+    "executive": "Executive",
+    "technical": "Technical",
+    "critique": "Critique",
+    "eli5": "Explain Like I'm 5",
+}
+
+ANALYSIS_TYPES = {
+    "methodology": "Methodology",
+    "literature": "Literature Context",
+    "future_research": "Future Research",
+    "practical_applications": "Practical Applications",
+}
+
+# Sidebar options; the ones mapped to an analysis type unlock it in the Analysis tab
+ANALYSIS_OPTIONS = {
+    "Extract Keywords": None,
+    "Analyze Methodology": "methodology",
+    "Analyze Literature Context": "literature",
+    "Identify Future Research": "future_research",
+    "Find Practical Applications": "practical_applications",
+    "Extract Figures & Tables": None,
+    "Generate Citation Graph": None,
+}
+
+COMPARISON_FOCUS = {
+    "Full Comparison": "",
+    "Methodology Comparison": "Concentrate on how the research designs, data, and methods differ and which is more rigorous.",
+    "Results Comparison": "Concentrate on the findings: where results agree, where they conflict, and how strong the evidence is.",
+}
 
 # Set page configuration
 st.set_page_config(
-    page_title="Advanced Research Paper Summarizer",
+    page_title=APP_TITLE,
     page_icon="📚",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 # Initialize session state variables
-if 'history' not in st.session_state:
-    st.session_state.history = []
-if 'extracted_text' not in st.session_state:
-    st.session_state.extracted_text = ""
-if 'processed_papers' not in st.session_state:
-    st.session_state.processed_papers = []
-if 'current_summary' not in st.session_state:
-    st.session_state.current_summary = ""
-if 'paper_metadata' not in st.session_state:
-    st.session_state.paper_metadata = {}
-if 'figures' not in st.session_state:
-    st.session_state.figures = []
-if 'tables' not in st.session_state:
-    st.session_state.tables = []
-if 'references' not in st.session_state:
-    st.session_state.references = []
+SESSION_DEFAULTS = {
+    "history": [],
+    "extracted_text": "",
+    "processed_papers": [],
+    "current_summary": "",
+    "summary_info": "",
+    "paper_metadata": {},
+    "figures": [],
+    "tables": [],
+    "references": [],
+    "paper_id": None,
+    "paper_source": "",
+    "analyses": {},
+    "follow_up_questions": "",
+    "comparison": "",
+    "last_upload_id": None,
+    "paper_cache": {},
+}
+for _key, _value in SESSION_DEFAULTS.items():
+    if _key not in st.session_state:
+        st.session_state[_key] = _value.copy() if isinstance(_value, (list, dict)) else _value
 
 # Custom CSS
 st.markdown("""
 <style>
     .main-header {color: #1E88E5; font-size: 40px; font-weight: bold; margin-bottom: 20px; text-align: center;}
-    .section-header {color: #0D47A1; font-size: 24px; font-weight: bold; margin-top: 20px; margin-bottom: 10px;}
-    .subsection-header {color: #1565C0; font-size: 18px; font-weight: bold; margin-top: 10px;}
-    .info-box {background-color: #E3F2FD; padding: 15px; border-radius: 5px; margin-bottom: 15px;}
-    .success-box {background-color: #E8F5E9; padding: 15px; border-radius: 5px; margin-bottom: 15px;}
-    .warning-box {background-color: #FFF8E1; padding: 15px; border-radius: 5px; margin-bottom: 15px;}
-    .error-box {background-color: #FFEBEE; padding: 15px; border-radius: 5px; margin-bottom: 15px;}
 </style>
 """, unsafe_allow_html=True)
 
 
+class GeminiError(Exception):
+    """Raised when a Gemini request cannot be completed."""
+
+
+class PaperLookupError(Exception):
+    """Raised when a DOI / arXiv lookup fails."""
+
+
 # Define enhanced functions for text extraction
-def extract_text_from_pdf(pdf_file):
-    """Extract text, figures, tables and metadata from PDF."""
-    # Create a temporary file
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-        tmp_file.write(pdf_file.getvalue())
-        tmp_path = tmp_file.name
-
-    # Extract text using PyPDF2
-    pdf_reader = PyPDF2.PdfReader(pdf_file)
-    text = ""
-    metadata = {}
-
-    # Get metadata
-    if pdf_reader.metadata:
-        for key in pdf_reader.metadata:
-            if key and pdf_reader.metadata[key]:
-                clean_key = key.strip('/').lower()
-                metadata[clean_key] = pdf_reader.metadata[key]
-
-    # Extract text
-    for page in pdf_reader.pages:
-        text += page.extract_text() + "\n"
-
-    # Use PyMuPDF to extract images and tables
-    figures = []
-    tables = []
-
+def extract_text_from_pdf(pdf_bytes):
+    """Extract text, figures, tables and metadata from PDF bytes."""
     try:
-        doc = fitz.open(tmp_path)
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as e:
+        raise ValueError(f"The file could not be read as a PDF ({e}).") from e
+
+    with doc:
+        if doc.needs_pass:
+            raise ValueError("This PDF is password-protected. Please upload an unlocked copy.")
+
+        metadata = {}
+        pdf_meta = doc.metadata or {}
+        if pdf_meta.get("title", "").strip():
+            metadata["title"] = pdf_meta["title"].strip()
+        if pdf_meta.get("author", "").strip():
+            metadata["authors"] = [a.strip() for a in re.split(r";|\band\b", pdf_meta["author"]) if a.strip()]
+
+        text = "\n".join(page.get_text() for page in doc)
 
         # Extract images
+        figures = []
+        seen_xrefs = set()
         for page_num, page in enumerate(doc):
-            image_list = page.get_images(full=True)
-
-            for img_index, img_info in enumerate(image_list):
+            for img_info in page.get_images(full=True):
                 xref = img_info[0]
-                base_image = doc.extract_image(xref)
-                image_bytes = base_image["image"]
-
-                # Create a PIL image
-                image = Image.open(BytesIO(image_bytes))
-
-                # Convert to base64 for displaying
-                buffered = BytesIO()
-                image.save(buffered, format="PNG")
-                img_str = base64.b64encode(buffered.getvalue()).decode()
-
-                # Save figure info
-                figures.append({
-                    "page": page_num + 1,
-                    "index": img_index,
-                    "data": img_str,
-                    "width": image.width,
-                    "height": image.height
-                })
-
-        # Try to identify tables through heuristics
-        for page_num, page in enumerate(doc):
-            # Look for table-like structures using text blocks
-            blocks = page.get_text("blocks")
-            for block_num, block in enumerate(blocks):
-                # Simple heuristic: blocks with many spaces and few newlines might be tables
-                text_block = block[4]
-                spaces = text_block.count(' ')
-                newlines = text_block.count('\n')
-
-                if spaces > 20 and newlines > 3 and spaces / len(text_block) > 0.15:
-                    tables.append({
+                if xref in seen_xrefs or len(figures) >= MAX_FIGURES:
+                    continue
+                seen_xrefs.add(xref)
+                try:
+                    pix = pymupdf.Pixmap(doc, xref)
+                    if pix.width < MIN_FIGURE_SIZE or pix.height < MIN_FIGURE_SIZE:
+                        continue
+                    if pix.n - pix.alpha >= 4:  # CMYK and similar -> RGB
+                        pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+                    figures.append({
                         "page": page_num + 1,
-                        "index": block_num,
-                        "text": text_block
+                        "data": pix.tobytes("png"),
+                        "width": pix.width,
+                        "height": pix.height
                     })
+                except Exception:
+                    continue  # skip images in unsupported formats
 
-    except Exception as e:
-        st.warning(f"Error extracting images/tables: {e}")
-
-    finally:
-        # Clean up the temporary file
-        try:
-            os.unlink(tmp_path)
-        except:
-            pass
+        # Detect tables
+        tables = []
+        for page_num, page in enumerate(doc):
+            try:
+                found = page.find_tables()
+            except Exception:
+                continue
+            for table in found.tables:
+                rows = [["" if cell is None else str(cell) for cell in row] for row in table.extract()]
+                if len(rows) >= 2 and max(len(r) for r in rows) >= 2:
+                    tables.append({"page": page_num + 1, "rows": rows})
 
     return text, metadata, figures, tables
 
 
 def extract_references(text):
-    """Extract references section from the paper"""
+    """Extract individual entries from the references section of the paper"""
+    heading = re.compile(
+        r'^\s*(?:\d+\.?\s*)?(references|bibliography|works cited|literature cited)\s*:?\s*$',
+        re.IGNORECASE | re.MULTILINE
+    )
+    matches = list(heading.finditer(text))
+    if not matches:
+        matches = list(re.finditer(r'references|bibliography|works cited', text, re.IGNORECASE))
+    if not matches:
+        return []
+
+    # The last match is most likely the actual references section
+    ref_text = text[matches[-1].end():]
+
+    if re.search(r'^\s*\[\d+\]', ref_text, re.MULTILINE):
+        entries = re.split(r'^\s*\[\d+\]\s*', ref_text, flags=re.MULTILINE)
+    elif re.search(r'^\s*\d+\.\s+\S', ref_text, re.MULTILINE):
+        entries = re.split(r'^\s*\d+\.\s+', ref_text, flags=re.MULTILINE)
+    else:
+        # Author-year style: a new entry starts with "Surname, X"
+        entries = re.split(r"\n(?=[A-Z][A-Za-z'\-]+,\s+[A-Z])", ref_text)
+
     references = []
-
-    # Try to find references section
-    references_pattern = re.compile(r'references|bibliography|works cited', re.IGNORECASE)
-    matches = list(references_pattern.finditer(text))
-
-    if matches:
-        # Get the last match which is likely the actual references section
-        ref_start = matches[-1].start()
-        ref_text = text[ref_start:]
-
-        # Split by common reference patterns
-        ref_entries = re.split(r'\[\d+\]|\n\d+\.|\n[A-Z][a-z]+,', ref_text)
-
-        # Clean up entries
-        if len(ref_entries) > 1:
-            for entry in ref_entries[1:]:  # Skip the header
-                clean_entry = entry.strip()
-                if len(clean_entry) > 20:  # Minimum length to be a valid reference
-                    references.append(clean_entry)
-
-    return references
+    for entry in entries:
+        clean_entry = re.sub(r'\s+', ' ', entry).strip()
+        if len(clean_entry) > 20:  # Minimum length to be a valid reference
+            references.append(clean_entry)
+    return references[:500]
 
 
-def clean_text(text):
-    """Clean extracted text for better processing"""
-    # Remove extra whitespaces and newlines
-    text = re.sub(r'\s+', ' ', text)
+def prepare_text_for_model(text):
+    """Normalise whitespace and trim the text to the configured input limit.
 
-    # Remove headers and footers (common patterns)
-    text = re.sub(r'\b(?:Page \d+|^\d+$)', '', text)
-
-    # Remove URLs
-    text = re.sub(r'https?://\S+', '', text)
-
-    # Fix broken words
-    text = re.sub(r'(\w)- (\w)', r'\1\2', text)
-
-    return text.strip()
+    Returns the prepared text and whether it was truncated."""
+    text = re.sub(r'(\w)-\n(\w)', r'\1\2', text)  # re-join words hyphenated across lines
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n\s*\n+', '\n\n', text).strip()
+    if len(text) > MAX_INPUT_CHARS:
+        return text[:MAX_INPUT_CHARS], True
+    return text, False
 
 
-def split_into_sections(text):
-    """Split the paper into sections based on common headings"""
-    # Define common section headings
-    section_patterns = [
-        r'\n\d+\.?\s+[A-Z][A-Za-z\s]+\n',  # Numbered sections: "1. Introduction"
-        r'\n[A-Z][A-Z\s]+\n',  # ALL CAPS sections: "INTRODUCTION"
-        r'\n[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\n'  # Title Case sections: "Introduction" or "Related Work"
-    ]
+def paper_id_for(content):
+    """Stable identifier for a paper's content."""
+    if isinstance(content, str):
+        content = content.encode("utf-8")
+    return hashlib.sha256(content).hexdigest()[:16]
 
-    # Combine patterns
-    combined_pattern = '|'.join(section_patterns)
 
-    # Find all section headings
-    headings = re.finditer(combined_pattern, text)
+def safe_filename(title, default="research_paper"):
+    safe = re.sub(r'[^\w\s-]', '', title or "").strip()
+    safe = re.sub(r'\s+', '_', safe)[:80]
+    return safe or default
 
-    sections = []
-    last_pos = 0
 
-    for match in headings:
-        if last_pos > 0:
-            section_text = text[last_pos:match.start()].strip()
-            if section_text:
-                sections.append({
-                    "heading": current_heading,
-                    "text": section_text
-                })
-
-        current_heading = match.group().strip()
-        last_pos = match.end()
-
-    if last_pos < len(text):
-        section_text = text[last_pos:].strip()
-        if section_text:
-            sections.append({
-                "heading": current_heading if 'current_heading' in locals() else "Content",
-                "text": section_text
-            })
-
-    return sections
+def format_authors(metadata):
+    authors = metadata.get("authors") or []
+    if isinstance(authors, str):
+        return authors
+    return ", ".join(authors) if authors else "Unknown"
 
 
 # Advanced analysis functions
+@st.cache_data(show_spinner=False)
 def extract_keywords(text, top_n=10):
-    """Extract important keywords from the paper using TF-IDF"""
+    """Extract important keywords from the paper using TF-IDF.
+
+    The paper is split into passages so that terms concentrated in a few
+    passages score higher than terms that appear everywhere."""
     if not text or len(text) < 100:
         return []
 
-    # Remove common symbols and numbers
-    text = re.sub(r'[^\w\s]', '', text)
-    text = re.sub(r'\d+', '', text)
+    words = re.sub(r'[^A-Za-z\s-]', ' ', text).split()
+    passages = [" ".join(words[i:i + 80]) for i in range(0, len(words), 80)]
+    if not passages:
+        return []
 
-    # Create vectorizer
     vectorizer = TfidfVectorizer(
-        max_features=100,
         stop_words='english',
         ngram_range=(1, 2),
-        min_df=2
+        min_df=2 if len(passages) >= 4 else 1,
+        max_df=0.9 if len(passages) >= 4 else 1.0,
+        sublinear_tf=True,
+        token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z-]{2,}\b"
     )
 
     try:
-        # Generate TF-IDF matrix
-        tfidf_matrix = vectorizer.fit_transform([text])
-
-        # Get feature names and scores
-        feature_names = vectorizer.get_feature_names_out()
-        scores = tfidf_matrix.toarray()[0]
-
-        # Sort keywords by score
-        keyword_scores = sorted(
-            [(feature_names[i], scores[i]) for i in range(len(feature_names))],
-            key=lambda x: x[1],
-            reverse=True
-        )
-
-        return keyword_scores[:top_n]
-    except:
+        tfidf_matrix = vectorizer.fit_transform(passages)
+    except ValueError:
         return []
+
+    feature_names = vectorizer.get_feature_names_out()
+    scores = tfidf_matrix.sum(axis=0).A1
+    keyword_scores = sorted(zip(feature_names, scores), key=lambda x: x[1], reverse=True)
+    return [(word, float(score)) for word, score in keyword_scores[:top_n]]
 
 
 def create_word_cloud_data(text):
     """Prepare data for word cloud visualization"""
-    # Extract keywords with scores
     keywords = extract_keywords(text, top_n=50)
-
     if not keywords:
         return []
 
     # Normalize scores for visualization
-    max_score = max([score for _, score in keywords])
-    normalized = [(word, int((score / max_score) * 100)) for word, score in keywords]
-
-    return normalized
+    max_score = max(score for _, score in keywords)
+    return [(word, int((score / max_score) * 100)) for word, score in keywords]
 
 
 def generate_citation_graph(references):
-    """Generate a simple citation network visualization data"""
+    """Count cited works by publication year"""
     if not references or len(references) < 3:
         return None
 
-    # Extract years from references (simple heuristic)
-    years = []
+    current_year = datetime.now().year
+    year_counts = {}
     for ref in references:
-        year_match = re.search(r'(19|20)\d{2}', ref)
-        if year_match:
-            years.append(int(year_match.group(0)))
+        for match in re.finditer(r'\b(19[5-9]\d|20\d{2})\b', ref):
+            year = int(match.group(1))
+            if year <= current_year:
+                year_counts[year] = year_counts.get(year, 0) + 1
+                break
 
-    if not years:
+    if not year_counts:
+        return None
+    return sorted(year_counts.items())
+
+
+# Gemini API helpers
+def get_api_key():
+    """API key from the sidebar, then the environment, then Streamlit secrets."""
+    key = st.session_state.get("api_key_input") or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if key:
+        return key.strip()
+    try:
+        return st.secrets.get("GOOGLE_API_KEY")
+    except Exception:
         return None
 
-    # Count citations by year
-    year_counts = {}
-    for year in years:
-        if year in year_counts:
-            year_counts[year] += 1
-        else:
-            year_counts[year] = 1
 
-    # Convert to list of (year, count) tuples
-    data = [(year, count) for year, count in year_counts.items()]
-    data.sort(key=lambda x: x[0])  # Sort by year
+@st.cache_resource(show_spinner=False)
+def get_client(api_key):
+    return genai.Client(api_key=api_key)
 
-    return data
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def list_available_models(api_key):
+    """Gemini text models available to this API key."""
+    names = set()
+    for model in get_client(api_key).models.list():
+        name = (model.name or "").removeprefix("models/")
+        actions = model.supported_actions or []
+        if (name.startswith("gemini") and "generateContent" in actions
+                and not any(tag in name for tag in ("tts", "image", "live", "audio", "embedding"))):
+            names.add(name)
+    return sorted(names, reverse=True)
+
+
+def _describe_api_error(error):
+    code = getattr(error, "code", None)
+    message = getattr(error, "message", None) or str(error)
+    if code in (401, 403) or "API key not valid" in message:
+        return "The Google API key was rejected. Check the key in your .env file or the sidebar."
+    if code == 404:
+        return f"The selected model is not available: {message}. Choose a different model in the sidebar."
+    if code == 429:
+        return "The Gemini API quota or rate limit was reached. Wait a moment and try again."
+    return f"Gemini API error ({code}): {message}"
+
+
+def call_gemini(prompt, model_name, json_output=False):
+    """Send a prompt to Gemini and return the response text."""
+    api_key = get_api_key()
+    if not api_key:
+        raise GeminiError("No Google API key configured. Add GOOGLE_API_KEY to your .env file or enter it in the sidebar.")
+
+    config = types.GenerateContentConfig(response_mime_type="application/json") if json_output else None
+    try:
+        response = get_client(api_key).models.generate_content(
+            model=model_name.removeprefix("models/"),
+            contents=prompt,
+            config=config
+        )
+    except genai_errors.APIError as e:
+        raise GeminiError(_describe_api_error(e)) from e
+    except requests.exceptions.RequestException as e:
+        raise GeminiError(f"Could not reach the Gemini API: {e}") from e
+    except Exception as e:
+        raise GeminiError(f"Unexpected error calling the Gemini API: {e}") from e
+
+    text = response.text
+    if not text or not text.strip():
+        raise GeminiError("The model returned an empty response. It may have been blocked by safety filters; try another summary type or model.")
+    return text.strip()
 
 
 # Define functions for generating summaries using Gemini API
-def generate_summary(text, model_name="models/gemini-1.5-pro", summary_type="comprehensive"):
+def generate_summary(text, model_name=DEFAULT_MODEL, summary_type="comprehensive"):
     """Generate paper summary using Gemini API"""
-    model = genai.GenerativeModel(model_name)
-
-    # Truncate text if too long (Gemini has input limits)
-    max_chars = 30000
-    if len(text) > max_chars:
-        text = text[:max_chars] + "..."
+    text, _ = prepare_text_for_model(text)
 
     prompts = {
         "comprehensive": f"""
         You are a research assistant specialized in summarizing academic papers.
         Provide a comprehensive summary of the following research paper:
 
+        <paper>
         {text}
+        </paper>
 
         Structure your summary as follows:
         # Paper Summary
@@ -353,19 +396,23 @@ def generate_summary(text, model_name="models/gemini-1.5-pro", summary_type="com
         """,
 
         "executive": f"""
-        Provide a concise executive summary (250-350 words) of the following research paper, 
+        Provide a concise executive summary (250-350 words) of the following research paper,
         focusing on the problem addressed, key findings, and practical implications:
 
+        <paper>
         {text}
+        </paper>
 
         Format your response in Markdown.
         """,
 
         "technical": f"""
-        Provide a technical summary of the following research paper, focusing on the methodology, 
+        Provide a technical summary of the following research paper, focusing on the methodology,
         technical innovations, algorithms, and experimental results:
 
+        <paper>
         {text}
+        </paper>
 
         Structure your summary as follows:
         # Technical Summary
@@ -380,10 +427,12 @@ def generate_summary(text, model_name="models/gemini-1.5-pro", summary_type="com
         """,
 
         "critique": f"""
-        Provide a critical analysis of the following research paper, evaluating its strengths, 
+        Provide a critical analysis of the following research paper, evaluating its strengths,
         weaknesses, methodological rigor, and contributions to the field:
 
+        <paper>
         {text}
+        </paper>
 
         Structure your critique as follows:
         # Critical Analysis
@@ -401,35 +450,29 @@ def generate_summary(text, model_name="models/gemini-1.5-pro", summary_type="com
         Explain the following research paper as if you were explaining it to a 5th grader.
         Use simple language, analogies, and focus on the big picture ideas:
 
+        <paper>
         {text}
+        </paper>
 
         Keep your explanation under 500 words and make it engaging and easy to understand.
         Format your response in Markdown.
         """
     }
 
-    try:
-        response = model.generate_content(prompts[summary_type])
-        return response.text
-    except Exception as e:
-        st.error(f"Error generating summary: {e}")
-        return f"Error generating summary: {str(e)}"
+    return call_gemini(prompts[summary_type], model_name)
 
 
-def generate_detailed_analysis(text, model_name="models/gemini-1.5-pro", analysis_type="methodology"):
+def generate_detailed_analysis(text, model_name=DEFAULT_MODEL, analysis_type="methodology"):
     """Generate detailed analysis of specific aspects of the paper"""
-    model = genai.GenerativeModel(model_name)
-
-    # Truncate text if too long
-    max_chars = 30000
-    if len(text) > max_chars:
-        text = text[:max_chars] + "..."
+    text, _ = prepare_text_for_model(text)
 
     prompts = {
         "methodology": f"""
         Provide a detailed analysis of the methodology used in this research paper:
 
+        <paper>
         {text}
+        </paper>
 
         Focus on:
         1. Research design and approach
@@ -445,7 +488,9 @@ def generate_detailed_analysis(text, model_name="models/gemini-1.5-pro", analysi
         "literature": f"""
         Analyze how this paper relates to existing literature in the field:
 
+        <paper>
         {text}
+        </paper>
 
         Focus on:
         1. Key works cited and their importance
@@ -460,7 +505,9 @@ def generate_detailed_analysis(text, model_name="models/gemini-1.5-pro", analysi
         "future_research": f"""
         Based on this research paper, identify promising directions for future research:
 
+        <paper>
         {text}
+        </paper>
 
         Consider:
         1. Unanswered questions raised by this paper
@@ -475,7 +522,9 @@ def generate_detailed_analysis(text, model_name="models/gemini-1.5-pro", analysi
         "practical_applications": f"""
         Identify and elaborate on the practical applications of this research:
 
+        <paper>
         {text}
+        </paper>
 
         Focus on:
         1. Industry applications
@@ -488,114 +537,100 @@ def generate_detailed_analysis(text, model_name="models/gemini-1.5-pro", analysi
         """
     }
 
-    try:
-        response = model.generate_content(prompts[analysis_type])
-        return response.text
-    except Exception as e:
-        return f"Error generating analysis: {str(e)}"
+    return call_gemini(prompts[analysis_type], model_name)
 
 
-def generate_follow_up_questions(text, model_name="models/gemini-1.5-pro"):
+def generate_follow_up_questions(text, model_name=DEFAULT_MODEL):
     """Generate insightful follow-up questions about the paper"""
-    model = genai.GenerativeModel(model_name)
+    text, _ = prepare_text_for_model(text)
 
     prompt = f"""
     Read the following research paper and generate 5 insightful follow-up questions that a researcher
     might ask after reading this paper. These questions should probe deeper into the methodology,
     explore limitations, suggest extensions, or connect to broader research themes.
 
-    {text[:20000]}  # Limit text size
+    <paper>
+    {text}
+    </paper>
 
     Format your response as a numbered list in Markdown.
     """
 
-    try:
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"Error generating questions: {str(e)}"
+    return call_gemini(prompt, model_name)
 
 
-def extract_paper_details(text, model_name="models/gemini-1.5-pro"):
-    """Extract structured metadata from the paper using Gemini"""
-    model = genai.GenerativeModel(model_name)
-
+def extract_paper_details(text, model_name=DEFAULT_MODEL):
+    """Extract structured metadata from the beginning of the paper using Gemini"""
     prompt = f"""
-    Extract the following metadata from this research paper:
+    Extract the following metadata from the beginning of this research paper:
 
-    {text[:5000]}  # Use just the beginning where metadata is typically found
+    <paper>
+    {text[:6000]}
+    </paper>
 
-    Return the results in JSON format with these fields:
-    1. title (string): The paper's title
-    2. authors (array of strings): List of authors
-    3. publication_year (number or null): Year of publication
-    4. journal_or_conference (string or null): Publication venue
-    5. keywords (array of strings): Author-provided keywords
-    6. doi (string or null): DOI if present
+    Return a JSON object with these fields:
+    - title (string): The paper's title
+    - authors (array of strings): List of authors
+    - publication_year (integer or null): Year of publication
+    - journal_or_conference (string or null): Publication venue
+    - keywords (array of strings): Author-provided keywords
+    - doi (string or null): DOI if present
 
-    Format as valid JSON without explanations.
+    Use null or an empty array for anything that is not stated in the text.
     """
 
+    raw = call_gemini(prompt, model_name, json_output=True)
+    raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw.strip())
     try:
-        response = model.generate_content(prompt)
-        try:
-            # Try to parse as JSON
-            return json.loads(response.text)
-        except:
-            # If parsing fails, extract with regex as fallback
-            title_match = re.search(r'"title":\s*"([^"]+)"', response.text)
-            title = title_match.group(1) if title_match else "Unknown Title"
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise GeminiError("The model did not return valid metadata JSON.") from e
+    if isinstance(data, list) and data:
+        data = data[0]
+    if not isinstance(data, dict):
+        raise GeminiError("The model did not return a metadata object.")
 
-            authors_match = re.search(r'"authors":\s*\[(.*?)\]', response.text, re.DOTALL)
-            authors = []
-            if authors_match:
-                authors_text = authors_match.group(1)
-                author_matches = re.findall(r'"([^"]+)"', authors_text)
-                authors = author_matches if author_matches else ["Unknown Authors"]
+    year = data.get("publication_year")
+    try:
+        year = int(year) if year not in (None, "") else None
+    except (TypeError, ValueError):
+        year = None
 
-            year_match = re.search(r'"publication_year":\s*(\d{4}|null)', response.text)
-            year = year_match.group(1) if year_match else None
+    def as_list(value):
+        if isinstance(value, str):
+            return [value] if value.strip() else []
+        return [str(v) for v in value or [] if str(v).strip()]
 
-            return {
-                "title": title,
-                "authors": authors,
-                "publication_year": year,
-                "journal_or_conference": None,
-                "keywords": [],
-                "doi": None
-            }
-    except Exception as e:
-        return {
-            "title": "Unknown Title",
-            "authors": ["Unknown Authors"],
-            "publication_year": None,
-            "journal_or_conference": None,
-            "keywords": [],
-            "doi": None,
-            "error": str(e)
-        }
+    return {
+        "title": (data.get("title") or "").strip() or None,
+        "authors": as_list(data.get("authors")),
+        "publication_year": year,
+        "journal_or_conference": data.get("journal_or_conference") or None,
+        "keywords": as_list(data.get("keywords")),
+        "doi": data.get("doi") or None,
+    }
 
 
-def compare_papers(papers_text, model_name="models/gemini-1.5-pro"):
+def compare_papers(papers_text, model_name=DEFAULT_MODEL, comparison_type="Full Comparison"):
     """Compare multiple research papers"""
     if len(papers_text) < 2:
-        return "Need at least two papers to compare"
-
-    model = genai.GenerativeModel(model_name)
+        raise ValueError("Need at least two papers to compare")
 
     # Create summaries of each paper first to reduce token usage
     summaries = []
     for i, text in enumerate(papers_text):
-        # Generate a brief summary
-        brief_summary = generate_summary(text[:30000], model_name, "executive")
-        summaries.append(f"Paper {i + 1}: {brief_summary}")
+        brief_summary = generate_summary(text, model_name, "executive")
+        summaries.append(f"Paper {i + 1}:\n{brief_summary}")
 
     combined_summaries = "\n\n".join(summaries)
+    focus = COMPARISON_FOCUS.get(comparison_type, "")
 
     prompt = f"""
     Compare and contrast the following research papers based on these summaries:
 
     {combined_summaries}
+
+    {focus}
 
     Structure your comparison as follows:
     # Comparative Analysis
@@ -610,45 +645,277 @@ def compare_papers(papers_text, model_name="models/gemini-1.5-pro"):
     Format your response in Markdown.
     """
 
+    return call_gemini(prompt, model_name)
+
+
+# Paper loading
+def build_paper(text, metadata, figures=None, tables=None, source=""):
+    return {
+        "id": paper_id_for(text),
+        "text": text,
+        "metadata": metadata,
+        "figures": figures or [],
+        "tables": tables or [],
+        "references": extract_references(text),
+        "filename": source,
+    }
+
+
+def enrich_metadata(paper, model_name):
+    """Fill in title/authors/etc. with Gemini. Failures are non-fatal."""
+    if not get_api_key():
+        return
     try:
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"Error generating comparison: {str(e)}"
+        ai_metadata = extract_paper_details(paper["text"], model_name)
+    except GeminiError as e:
+        st.caption(f"Could not extract paper details automatically: {e}")
+        return
+    for key, value in ai_metadata.items():
+        if value:
+            paper["metadata"][key] = value
 
 
-# Save and load functions
-def save_summary_to_file(summary, metadata, filename=None):
-    """Save the summary and metadata to a markdown file"""
-    if not filename:
-        # Generate filename based on paper title
-        title = metadata.get("title", "research_paper")
-        safe_title = re.sub(r'[^\w\s-]', '', title).strip().replace(' ', '_')
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{safe_title}_{timestamp}.md"
+def process_pdf(pdf_bytes, filename, model_name):
+    """Extract a PDF once per session; later calls reuse the cached result."""
+    pid = paper_id_for(pdf_bytes)
+    cache = st.session_state.paper_cache
+    if pid in cache:
+        return cache[pid]
 
-    content = f"""# {metadata.get('title', 'Research Paper Summary')}
-Generated on: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    text, metadata, figures, tables = extract_text_from_pdf(pdf_bytes)
+    if len(text.strip()) < MIN_TEXT_CHARS:
+        raise ValueError("No selectable text was found. The PDF may be a scanned image; OCR is not supported.")
 
-## Paper Details
-- **Authors**: {', '.join(metadata.get('authors', ['Unknown']))}
-- **Year**: {metadata.get('publication_year', 'Unknown')}
-- **Journal/Conference**: {metadata.get('journal_or_conference', 'Unknown')}
-- **DOI**: {metadata.get('doi', 'Unknown')}
+    paper = build_paper(text, metadata, figures, tables, filename)
+    enrich_metadata(paper, model_name)
+    cache[pid] = paper
+    return paper
 
-## Summary
-{summary}
-"""
 
-    # Create downloads directory if it doesn't exist
-    downloads_dir = Path("downloads")
-    downloads_dir.mkdir(exist_ok=True)
+def load_paper(paper):
+    """Make a paper the active one and clear results from the previous paper."""
+    st.session_state.paper_id = paper["id"]
+    st.session_state.paper_source = paper.get("filename", "")
+    st.session_state.extracted_text = paper["text"]
+    st.session_state.paper_metadata = dict(paper["metadata"])
+    st.session_state.figures = paper["figures"]
+    st.session_state.tables = paper["tables"]
+    st.session_state.references = paper["references"]
+    st.session_state.current_summary = paper.get("summary", "")
+    st.session_state.summary_info = paper.get("summary_info", "")
+    st.session_state.analyses = dict(paper.get("analyses", {}))
+    st.session_state.follow_up_questions = paper.get("follow_up_questions", "")
 
-    file_path = downloads_dir / filename
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(content)
 
-    return file_path
+def _http_headers(include_contact=True):
+    """Request headers; the optional contact email is only sent to Crossref and arXiv."""
+    headers = {"User-Agent": "ResearchPaperSummarizer/1.0"}
+    mailto = os.getenv("CROSSREF_MAILTO")
+    if mailto and include_contact:
+        headers["User-Agent"] += f" (mailto:{mailto})"
+    return headers
+
+
+def _download(url, accept_pdf_only=False, include_contact=False):
+    """Download a URL with a timeout and size limit."""
+    limit = MAX_DOWNLOAD_MB * 1024 * 1024
+    with requests.get(url, headers=_http_headers(include_contact), timeout=REQUEST_TIMEOUT, stream=True) as response:
+        response.raise_for_status()
+        chunks, size = [], 0
+        for chunk in response.iter_content(65536):
+            size += len(chunk)
+            if size > limit:
+                raise PaperLookupError(f"The file is larger than {MAX_DOWNLOAD_MB} MB.")
+            chunks.append(chunk)
+    data = b"".join(chunks)
+    if accept_pdf_only and not data.startswith(b"%PDF"):
+        raise PaperLookupError("The link did not return a PDF.")
+    return data
+
+
+def fetch_crossref_record(doi):
+    """Return (metadata, raw record) for a DOI from Crossref."""
+    try:
+        response = requests.get(f"https://api.crossref.org/works/{quote(doi)}",
+                                headers=_http_headers(), timeout=REQUEST_TIMEOUT)
+    except requests.exceptions.RequestException as e:
+        raise PaperLookupError(f"Could not reach Crossref: {e}") from e
+    if response.status_code == 404:
+        raise PaperLookupError(f"DOI {doi} was not found in Crossref.")
+    if not response.ok:
+        raise PaperLookupError(f"Crossref returned an error ({response.status_code}).")
+
+    record = response.json().get("message", {})
+    date_parts = (record.get("issued") or {}).get("date-parts") or [[None]]
+    metadata = {
+        "title": " ".join(record.get("title") or []) or None,
+        "authors": [
+            " ".join(p for p in (a.get("given"), a.get("family")) if p) or a.get("name", "")
+            for a in record.get("author", [])
+        ],
+        "publication_year": date_parts[0][0] if date_parts and date_parts[0] else None,
+        "journal_or_conference": " ".join(record.get("container-title") or []) or None,
+        "keywords": record.get("subject") or [],
+        "doi": doi,
+    }
+    return metadata, record
+
+
+def fetch_arxiv_metadata(arxiv_id):
+    """Title, authors and year from the arXiv API."""
+    response = requests.get("https://export.arxiv.org/api/query", params={"id_list": arxiv_id},
+                            headers=_http_headers(), timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
+    entry = ET.fromstring(response.content).find("atom:entry", ns)
+    if entry is None:
+        return {}
+
+    def find_text(path):
+        node = entry.find(path, ns)
+        return re.sub(r'\s+', ' ', node.text).strip() if node is not None and node.text else None
+
+    published = find_text("atom:published")
+    return {
+        "title": find_text("atom:title"),
+        "authors": [re.sub(r'\s+', ' ', n.text).strip() for n in entry.findall("atom:author/atom:name", ns) if n.text],
+        "publication_year": int(published[:4]) if published else None,
+        "journal_or_conference": find_text("arxiv:journal_ref") or "arXiv preprint",
+        "doi": find_text("arxiv:doi") or f"10.48550/arXiv.{re.sub(r'v[0-9]+$', '', arxiv_id)}",
+    }
+
+
+ARXIV_PATTERN = re.compile(
+    r'^(?:https?://(?:www\.)?arxiv\.org/(?:abs|pdf)/|arxiv:|10\.48550/arxiv\.)?'
+    r'(\d{4}\.\d{4,5}(?:v\d+)?|[a-z\-]+(?:\.[A-Z]{2})?/\d{7}(?:v\d+)?)(?:\.pdf)?/?$',
+    re.IGNORECASE
+)
+DOI_PATTERN = re.compile(r'(10\.\d{4,9}/\S+)')
+
+
+def lookup_paper(identifier, model_name):
+    """Fetch a paper by arXiv ID/URL or DOI."""
+    identifier = identifier.strip()
+    if not identifier:
+        raise PaperLookupError("Enter a DOI or arXiv ID.")
+
+    arxiv_match = ARXIV_PATTERN.match(identifier)
+    if arxiv_match:
+        arxiv_id = arxiv_match.group(1)
+        try:
+            pdf_bytes = _download(f"https://arxiv.org/pdf/{arxiv_id}", accept_pdf_only=True, include_contact=True)
+        except requests.exceptions.RequestException as e:
+            raise PaperLookupError(f"Could not download arXiv paper {arxiv_id}: {e}") from e
+        paper = process_pdf(pdf_bytes, f"arXiv:{arxiv_id}", model_name)
+        try:
+            metadata = fetch_arxiv_metadata(arxiv_id)
+            paper["metadata"].update({k: v for k, v in metadata.items() if v})
+        except (requests.exceptions.RequestException, ET.ParseError):
+            pass  # metadata is optional; the full text is already loaded
+        return paper
+
+    doi_match = DOI_PATTERN.search(identifier)
+    if not doi_match:
+        raise PaperLookupError("That does not look like a DOI (10.xxxx/...) or an arXiv ID (e.g. 1706.03762).")
+    doi = doi_match.group(1).rstrip(".,;)")
+    metadata, record = fetch_crossref_record(doi)
+
+    # Prefer an openly available full-text PDF
+    for link in record.get("link", []):
+        if link.get("content-type") == "application/pdf" and link.get("URL"):
+            try:
+                pdf_bytes = _download(link["URL"], accept_pdf_only=True)
+                paper = process_pdf(pdf_bytes, f"doi:{doi}", model_name)
+                paper["metadata"].update({k: v for k, v in metadata.items() if v})
+                return paper
+            except (requests.exceptions.RequestException, PaperLookupError, ValueError):
+                continue
+
+    abstract = re.sub(r'<[^>]+>', ' ', record.get("abstract") or "")
+    abstract = re.sub(r'\s+', ' ', abstract).strip()
+    if not abstract:
+        raise PaperLookupError(
+            "Crossref has no open full text or abstract for this DOI. "
+            "Download the PDF from the publisher and use 'Upload PDF' instead."
+        )
+    text = f"{metadata['title'] or ''}\n\n{', '.join(metadata['authors'])}\n\nAbstract\n{abstract}"
+    paper = build_paper(text, metadata, source=f"doi:{doi}")
+    paper["abstract_only"] = True
+    return paper
+
+
+# Report building and export
+def _demote_headings(text):
+    return re.sub(r'^(#{1,5})(\s)', r'#\1\2', text, flags=re.MULTILINE)
+
+
+def build_report_markdown():
+    """Assemble all results for the current paper into one Markdown document."""
+    metadata = st.session_state.paper_metadata
+    sections = [
+        f"# {metadata.get('title') or 'Research Paper Summary'}",
+        f"Exported on: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "## Paper Details",
+        f"- **Authors**: {format_authors(metadata)}\n"
+        f"- **Year**: {metadata.get('publication_year') or 'Unknown'}\n"
+        f"- **Journal/Conference**: {metadata.get('journal_or_conference') or 'Unknown'}\n"
+        f"- **DOI**: {metadata.get('doi') or 'Unknown'}",
+    ]
+    if st.session_state.current_summary:
+        sections += ["## Summary", _demote_headings(st.session_state.current_summary)]
+    keywords = extract_keywords(st.session_state.extracted_text)
+    if keywords:
+        sections += ["## Keywords", ", ".join(word for word, _ in keywords)]
+    for analysis_type, result in st.session_state.analyses.items():
+        sections += [f"## {ANALYSIS_TYPES[analysis_type]} Analysis", _demote_headings(result)]
+    if st.session_state.follow_up_questions:
+        sections += ["## Follow-up Questions", _demote_headings(st.session_state.follow_up_questions)]
+    return "\n\n".join(sections) + "\n"
+
+
+def markdown_to_pdf(markdown_text, title):
+    """Render Markdown to a PDF using PyMuPDF (no external tools needed)."""
+    html = markdown.markdown(markdown_text, extensions=["tables", "fenced_code", "sane_lists"])
+    css = (
+        "body {font-family: sans-serif; font-size: 10.5pt; line-height: 1.4;} "
+        "h1 {font-size: 18pt;} h2 {font-size: 14pt; margin-top: 12pt;} h3 {font-size: 12pt;} "
+        "table {border-collapse: collapse;} td, th {border: 1px solid #999; padding: 3pt;} "
+        "code, pre {font-family: monospace; font-size: 9pt;}"
+    )
+    story = pymupdf.Story(html=html, user_css=css)
+    buffer = io.BytesIO()
+    writer = pymupdf.DocumentWriter(buffer)
+    page_rect = pymupdf.paper_rect("letter")
+    content_rect = page_rect + (54, 54, -54, -54)
+    more = True
+    while more:
+        device = writer.begin_page(page_rect)
+        more, _ = story.place(content_rect)
+        story.draw(device)
+        writer.end_page()
+    writer.close()
+
+    with pymupdf.open(stream=buffer.getvalue(), filetype="pdf") as doc:
+        doc.set_metadata({"title": title, "author": "", "creator": APP_TITLE, "producer": ""})
+        return doc.tobytes(garbage=3, deflate=True)
+
+
+def build_export_json():
+    export_data = {
+        "metadata": st.session_state.paper_metadata,
+        "summary": st.session_state.current_summary,
+        "summary_info": st.session_state.summary_info,
+        "keywords": [
+            {"keyword": word, "score": round(score, 4)}
+            for word, score in extract_keywords(st.session_state.extracted_text)
+        ],
+        "analyses": st.session_state.analyses,
+        "follow_up_questions": st.session_state.follow_up_questions,
+        "references": st.session_state.references,
+        "tables": st.session_state.tables,
+        "export_date": datetime.now().isoformat()
+    }
+    return json.dumps(export_data, indent=2, ensure_ascii=False, default=str)
 
 
 # App UI Components
@@ -656,17 +923,33 @@ def render_sidebar():
     """Render the sidebar with configuration options"""
     st.sidebar.header("Configuration")
 
-    # Model selection
-    model_option = st.sidebar.selectbox(
-        "Select Gemini Model",
-        ["gemini-1.5-pro", "gemini-1.5-flash"],
-        index=0
+    # API key input
+    st.sidebar.subheader("API Configuration")
+    st.sidebar.text_input(
+        "Google API Key (if not in .env)",
+        type="password",
+        key="api_key_input",
+        help="Used only for this session. Get a key at https://aistudio.google.com/apikey"
     )
+    api_key = get_api_key()
+    if not api_key:
+        st.sidebar.warning("No API key found. AI features are disabled until a key is provided.")
+
+    # Model selection
+    models = []
+    if api_key:
+        try:
+            models = list_available_models(api_key)
+        except Exception:
+            st.sidebar.caption("Could not load the model list; using the default model.")
+    model_options = [DEFAULT_MODEL] + [m for m in models if m != DEFAULT_MODEL]
+    model_option = st.sidebar.selectbox("Select Gemini Model", model_options, index=0)
 
     # Summary type selection
     summary_type = st.sidebar.radio(
         "Summary Type",
-        ["comprehensive", "executive", "technical", "critique", "eli5"],
+        list(SUMMARY_TYPES),
+        format_func=SUMMARY_TYPES.get,
         index=0
     )
 
@@ -674,36 +957,27 @@ def render_sidebar():
     st.sidebar.subheader("Advanced Analysis")
     analysis_options = st.sidebar.multiselect(
         "Select additional analyses",
-        ["Extract Keywords", "Analyze Methodology", "Identify Future Research",
-         "Extract Figures & Tables", "Generate Citation Graph", "Find Practical Applications"],
-        default=["Extract Keywords"]
+        list(ANALYSIS_OPTIONS),
+        default=list(ANALYSIS_OPTIONS)
     )
-
-    # API key input
-    st.sidebar.subheader("API Configuration")
-    api_key_input = st.sidebar.text_input("Enter your Google API Key (if not in .env)", type="password")
-    if api_key_input:
-        genai.configure(api_key=api_key_input)
 
     # History management
     st.sidebar.subheader("History")
     if st.session_state.history:
-        history_titles = [f"{i + 1}. {h.get('title', 'Paper ' + str(i + 1))}" for i, h in
-                          enumerate(st.session_state.history)]
-        selected_history = st.sidebar.selectbox("Previously processed papers", history_titles)
+        history = st.session_state.history
+        selected_idx = st.sidebar.selectbox(
+            "Previously processed papers",
+            range(len(history)),
+            format_func=lambda i: f"{i + 1}. {history[i]['metadata'].get('title') or history[i].get('filename') or 'Untitled Paper'}"
+        )
         if st.sidebar.button("Load Selected Paper"):
-            idx = int(selected_history.split('.')[0]) - 1
-            if 0 <= idx < len(st.session_state.history):
-                st.session_state.extracted_text = st.session_state.history[idx].get('text', '')
-                st.session_state.current_summary = st.session_state.history[idx].get('summary', '')
-                st.session_state.paper_metadata = st.session_state.history[idx].get('metadata', {})
-                st.session_state.figures = st.session_state.history[idx].get('figures', [])
-                st.session_state.tables = st.session_state.history[idx].get('tables', [])
-                st.session_state.references = st.session_state.history[idx].get('references', [])
-                st.rerun()
-
-    if st.sidebar.button("Clear History"):
-        st.session_state.history = []
+            load_paper(history[selected_idx])
+            st.rerun()
+        if st.sidebar.button("Clear History"):
+            st.session_state.history = []
+            st.rerun()
+    else:
+        st.sidebar.caption("Papers you summarize will appear here.")
 
     # About section
     st.sidebar.markdown("---")
@@ -717,119 +991,125 @@ def render_sidebar():
     return model_option, summary_type, analysis_options
 
 
-def render_input_panel():
-    """Render the input section"""
+def render_input_panel(model_option):
+    """Render the input section and return the selected input method"""
     st.header("Paper Input")
 
     upload_option = st.radio("Choose input method:",
-                             ["Upload PDF", "Paste Text", "Upload Multiple PDFs", "DOI Lookup (coming soon)"])
-
-    input_text = st.session_state.extracted_text
-    multiple_papers = []
+                             ["Upload PDF", "Paste Text", "Upload Multiple PDFs", "DOI / arXiv Lookup"])
 
     if upload_option == "Upload PDF":
         uploaded_file = st.file_uploader("Upload a research paper (PDF)", type=["pdf"])
-        if uploaded_file is not None:
-            with st.spinner("Extracting text and content from PDF..."):
-                try:
-                    text, metadata, figures, tables = extract_text_from_pdf(uploaded_file)
-                    references = extract_references(text)
-
-                    st.session_state.extracted_text = text
-                    st.session_state.paper_metadata = metadata
-                    st.session_state.figures = figures
-                    st.session_state.tables = tables
-                    st.session_state.references = references
-
-                    input_text = text
-
-                    st.success(
-                        f"PDF processed successfully. Extracted {len(text)} characters, {len(figures)} figures, and {len(tables)} tables.")
-
-                    # Try to extract paper details
+        if uploaded_file is None:
+            st.session_state.last_upload_id = None  # so re-uploading the same file loads it again
+        else:
+            pdf_bytes = uploaded_file.getvalue()
+            upload_id = paper_id_for(pdf_bytes)
+            # Streamlit reruns the script on every interaction; only load a new upload once
+            if upload_id != st.session_state.last_upload_id:
+                with st.spinner("Extracting text and content from PDF..."):
                     try:
-                        ai_metadata = extract_paper_details(text)
-                        if ai_metadata and "title" in ai_metadata and ai_metadata["title"] != "Unknown Title":
-                            st.session_state.paper_metadata.update(ai_metadata)
-                    except:
-                        pass
-
-                    with st.expander("View extracted content"):
-                        st.text_area("Text content (sample)", text[:1000] + "...", height=200)
-                        if figures:
-                            st.write(f"Extracted {len(figures)} figures")
-                        if tables:
-                            st.write(f"Extracted {len(tables)} potential tables")
-                        if references:
-                            st.write(f"Extracted {len(references)} references")
-                except Exception as e:
-                    st.error(f"Error processing PDF: {e}")
+                        paper = process_pdf(pdf_bytes, uploaded_file.name, model_option)
+                    except ValueError as e:
+                        st.error(f"Error processing PDF: {e}")
+                        return upload_option
+                st.session_state.last_upload_id = upload_id
+                load_paper(paper)
+                st.success(
+                    f"PDF processed successfully. Extracted {len(paper['text']):,} characters, "
+                    f"{len(paper['figures'])} figures, and {len(paper['tables'])} tables.")
 
     elif upload_option == "Paste Text":
-        input_text = st.text_area("Paste the research paper text here:", height=400,
-                                  value=st.session_state.extracted_text)
-        if input_text and input_text != st.session_state.extracted_text:
-            st.session_state.extracted_text = input_text
-            st.session_state.references = extract_references(input_text)
-
-            # Try to extract paper details using AI
-            try:
-                ai_metadata = extract_paper_details(input_text)
-                if ai_metadata and "title" in ai_metadata:
-                    st.session_state.paper_metadata = ai_metadata
-            except:
-                pass
+        with st.form("paste_form"):
+            pasted = st.text_area("Paste the research paper text here:", height=400)
+            submitted = st.form_submit_button("Analyze Text")
+        if submitted:
+            if len(pasted.strip()) < MIN_TEXT_CHARS:
+                st.warning(f"Please paste at least {MIN_TEXT_CHARS} characters of text.")
+            else:
+                paper = build_paper(pasted.strip(), {}, source="Pasted text")
+                with st.spinner("Reading paper details..."):
+                    enrich_metadata(paper, model_option)
+                load_paper(paper)
+                st.success("Text loaded.")
 
     elif upload_option == "Upload Multiple PDFs":
         uploaded_files = st.file_uploader("Upload multiple research papers (PDF)", type=["pdf"],
                                           accept_multiple_files=True)
-        if uploaded_files:
-            st.info(f"Uploaded {len(uploaded_files)} files. Processing...")
+        papers = []
+        for i, file in enumerate(uploaded_files or []):
+            with st.spinner(f"Processing file {i + 1}/{len(uploaded_files)}..."):
+                try:
+                    papers.append(process_pdf(file.getvalue(), file.name, model_option))
+                except ValueError as e:
+                    st.error(f"Error processing {file.name}: {e}")
+        st.session_state.processed_papers = papers
 
-            for i, file in enumerate(uploaded_files):
-                with st.spinner(f"Processing file {i + 1}/{len(uploaded_files)}..."):
-                    try:
-                        text, metadata, figures, tables = extract_text_from_pdf(file)
-                        references = extract_references(text)
+        if papers:
+            st.write(f"Successfully processed {len(papers)} papers")
+            chosen = st.selectbox(
+                "Open a paper in the analysis panel",
+                range(len(papers)),
+                format_func=lambda i: f"{i + 1}. {papers[i]['metadata'].get('title') or papers[i]['filename']}"
+            )
+            if st.button("Open Paper"):
+                load_paper(papers[chosen])
+                st.rerun()
+            if len(papers) >= 2:
+                st.caption("Compare papers in the Paper Comparison section below.")
 
-                        # Get paper details
-                        try:
-                            ai_metadata = extract_paper_details(text)
-                            if ai_metadata and "title" in ai_metadata:
-                                metadata.update(ai_metadata)
-                        except:
-                            pass
+    elif upload_option == "DOI / arXiv Lookup":
+        with st.form("lookup_form"):
+            identifier = st.text_input("DOI or arXiv ID/URL", placeholder="10.48550/arXiv.1706.03762 or 1706.03762")
+            submitted = st.form_submit_button("Look Up Paper")
+        st.caption("arXiv papers are downloaded in full. For other DOIs the open-access PDF is used when "
+                   "Crossref lists one; otherwise only the abstract is available.")
+        if submitted:
+            with st.spinner("Looking up paper..."):
+                try:
+                    paper = lookup_paper(identifier, model_option)
+                except (PaperLookupError, ValueError) as e:
+                    st.error(str(e))
+                    return upload_option
+            load_paper(paper)
+            if paper.get("abstract_only"):
+                st.warning("Only the abstract was available, so results will be limited to it.")
+            else:
+                st.success(f"Loaded full text ({len(paper['text']):,} characters).")
 
-                        multiple_papers.append({
-                            "text": text,
-                            "metadata": metadata,
-                            "filename": file.name,
-                            "figures": figures,
-                            "tables": tables,
-                            "references": references
-                        })
+    if st.session_state.extracted_text:
+        text = st.session_state.extracted_text
+        with st.expander("View extracted content"):
+            st.text_area("Text content (sample)", text[:1000] + ("..." if len(text) > 1000 else ""),
+                         height=200, disabled=True)
+            st.write(f"{len(st.session_state.figures)} figures, {len(st.session_state.tables)} tables, "
+                     f"{len(st.session_state.references)} references")
+        if prepare_text_for_model(text)[1]:
+            st.caption(f"This paper is long; only the first {MAX_INPUT_CHARS:,} characters are sent to the model "
+                       "(set MAX_INPUT_CHARS in .env to change this).")
 
-                        st.success(f"Processed {file.name} successfully")
-                    except Exception as e:
-                        st.error(f"Error processing {file.name}: {e}")
+    return upload_option
 
-            if multiple_papers:
-                st.session_state.processed_papers = multiple_papers
-                st.write(f"Successfully processed {len(multiple_papers)} papers")
 
-                paper_titles = [f"{i + 1}. {p['metadata'].get('title', p['filename'])}" for i, p in
-                                enumerate(multiple_papers)]
-                st.multiselect("Select papers to compare", paper_titles, key="selected_papers_for_comparison")
-
-    return input_text, multiple_papers
+def run_ai_task(label, func, *args):
+    """Run a Gemini-backed task with a spinner; show an error and return None on failure."""
+    with st.spinner(label):
+        try:
+            return func(*args)
+        except GeminiError as e:
+            st.error(str(e))
+            return None
 
 
 def render_output_panel(model_option, summary_type, analysis_options):
     """Render the output section"""
     st.header("Analysis Output")
 
-    if not st.session_state.extracted_text and not st.session_state.processed_papers:
-        st.info("Please upload or paste a research paper to analyze")
+    if not st.session_state.extracted_text:
+        if st.session_state.processed_papers:
+            st.info("Open one of the uploaded papers to analyze it, or compare papers below.")
+        else:
+            st.info("Please upload or paste a research paper to analyze")
         return
 
     # Tab-based interface for different outputs
@@ -837,353 +1117,239 @@ def render_output_panel(model_option, summary_type, analysis_options):
 
     # Summary Tab
     with tabs[0]:
+        label = "Generate New Summary" if st.session_state.current_summary else "Generate Summary"
+        if st.button(label, type="primary"):
+            summary = run_ai_task("Generating summary with Gemini AI...", generate_summary,
+                                  st.session_state.extracted_text, model_option, summary_type)
+            if summary:
+                st.session_state.current_summary = summary
+                st.session_state.summary_info = f"{SUMMARY_TYPES[summary_type]} summary · {model_option}"
+                _update_history()
+
         if st.session_state.current_summary:
+            st.caption(st.session_state.summary_info)
             st.markdown(st.session_state.current_summary)
-
-            if st.button("Generate New Summary"):
-                with st.spinner("Generating summary with Gemini AI..."):
-                    try:
-                        model_name = f"models/{model_option}"
-                        summary = generate_summary(st.session_state.extracted_text, model_name, summary_type)
-                        st.session_state.current_summary = summary
-
-                        # Update history
-                        _update_history(summary)
-
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error generating summary: {e}")
-        else:
-            if st.button("Generate Summary"):
-                with st.spinner("Generating summary with Gemini AI..."):
-                    try:
-                        model_name = f"models/{model_option}"
-
-                        # Multiple papers comparison
-                        if "selected_papers_for_comparison" in st.session_state and st.session_state.selected_papers_for_comparison:
-                            selected_indices = [int(s.split('.')[0]) - 1 for s in
-                                                st.session_state.selected_papers_for_comparison]
-                            selected_papers = [st.session_state.processed_papers[i] for i in selected_indices if
-                                               i < len(st.session_state.processed_papers)]
-
-                            if len(selected_papers) > 1:
-                                papers_text = [p["text"] for p in selected_papers]
-                                summary = compare_papers(papers_text, model_name)
-                                st.session_state.current_summary = summary
-                                st.rerun()
-                            else:
-                                st.warning("Please select at least two papers to compare")
-
-                        # Single paper summary
-                        else:
-                            summary = generate_summary(st.session_state.extracted_text, model_name, summary_type)
-                            st.session_state.current_summary = summary
-
-                            # Update history
-                            _update_history(summary)
-
-                            st.rerun()
-                    except Exception as e:
-                        st.error(f"Error generating summary: {e}")
 
     # Analysis Tab
     with tabs[1]:
-        if not st.session_state.extracted_text:
-            st.info("Please process a paper first")
-        else:
-            # Create columns for different analyses
-            col1, col2 = st.columns(2)
+        col1, col2 = st.columns(2)
 
-            with col1:
-                st.subheader("Metadata")
-                metadata = st.session_state.paper_metadata
-                if metadata:
-                    st.write(f"**Title:** {metadata.get('title', 'Unknown')}")
-                    st.write(f"**Authors:** {', '.join(metadata.get('authors', ['Unknown']))}")
-                    st.write(f"**Year:** {metadata.get('publication_year', 'Unknown')}")
-                    st.write(f"**Journal/Conference:** {metadata.get('journal_or_conference', 'Unknown')}")
-                    if 'doi' in metadata and metadata['doi']:
-                        st.write(f"**DOI:** {metadata['doi']}")
+        with col1:
+            st.subheader("Metadata")
+            metadata = st.session_state.paper_metadata
+            st.write(f"**Title:** {metadata.get('title') or 'Unknown'}")
+            st.write(f"**Authors:** {format_authors(metadata)}")
+            st.write(f"**Year:** {metadata.get('publication_year') or 'Unknown'}")
+            st.write(f"**Journal/Conference:** {metadata.get('journal_or_conference') or 'Unknown'}")
+            if metadata.get("doi"):
+                st.write(f"**DOI:** {metadata['doi']}")
+
+            # References
+            if st.session_state.references:
+                with st.expander(f"References ({len(st.session_state.references)})"):
+                    for i, ref in enumerate(st.session_state.references):
+                        st.write(f"{i + 1}. {ref}")
+
+        with col2:
+            if "Extract Keywords" in analysis_options:
+                st.subheader("Keywords")
+                keywords = extract_keywords(st.session_state.extracted_text)
+                if keywords:
+                    df = pd.DataFrame(keywords, columns=["Keyword", "Score"])
+                    df["Score"] = df["Score"].round(4)
+                    st.dataframe(df, hide_index=True)
                 else:
-                    st.write("No metadata extracted")
+                    st.write("No keywords extracted")
 
-                # References
-                if st.session_state.references:
-                    with st.expander(f"References ({len(st.session_state.references)})"):
-                        for i, ref in enumerate(st.session_state.references):
-                            st.write(f"{i + 1}. {ref}")
-
-            with col2:
-                # Keywords
-                if "Extract Keywords" in analysis_options:
-                    st.subheader("Keywords")
-                    if st.button("Extract Keywords"):
-                        with st.spinner("Extracting keywords..."):
-                            keywords = extract_keywords(st.session_state.extracted_text)
-                            if keywords:
-                                # Create a dataframe for better display
-                                df = pd.DataFrame(keywords, columns=["Keyword", "Score"])
-                                df["Score"] = df["Score"].round(4)
-                                st.dataframe(df)
-                            else:
-                                st.write("No keywords extracted")
-
-            # In-depth analyses
-            st.subheader("Detailed Analysis")
-            analysis_type = st.selectbox(
-                "Select analysis type",
-                ["methodology", "literature", "future_research", "practical_applications"]
-            )
-
+        # In-depth analyses
+        available = [ANALYSIS_OPTIONS[o] for o in analysis_options if ANALYSIS_OPTIONS[o]]
+        st.subheader("Detailed Analysis")
+        if available:
+            analysis_type = st.selectbox("Select analysis type", available, format_func=ANALYSIS_TYPES.get)
             if st.button("Generate Analysis"):
-                with st.spinner("Generating detailed analysis..."):
-                    model_name = f"models/{model_option}"
-                    analysis = generate_detailed_analysis(
-                        st.session_state.extracted_text,
-                        model_name,
-                        analysis_type
-                    )
-                    st.markdown(analysis)
+                result = run_ai_task("Generating detailed analysis...", generate_detailed_analysis,
+                                     st.session_state.extracted_text, model_option, analysis_type)
+                if result:
+                    st.session_state.analyses[analysis_type] = result
+                    _update_history()
+            for key, result in st.session_state.analyses.items():
+                with st.expander(f"{ANALYSIS_TYPES[key]} Analysis", expanded=(key == analysis_type)):
+                    st.markdown(result)
+        else:
+            st.caption("Enable an analysis type under Advanced Analysis in the sidebar.")
 
-            # Follow-up questions
-            st.subheader("Research Questions")
-            if st.button("Generate Follow-up Questions"):
-                with st.spinner("Generating questions..."):
-                    model_name = f"models/{model_option}"
-                    questions = generate_follow_up_questions(
-                        st.session_state.extracted_text,
-                        model_name
-                    )
-                    st.markdown(questions)
+        # Follow-up questions
+        st.subheader("Research Questions")
+        if st.button("Generate Follow-up Questions"):
+            questions = run_ai_task("Generating questions...", generate_follow_up_questions,
+                                    st.session_state.extracted_text, model_option)
+            if questions:
+                st.session_state.follow_up_questions = questions
+                _update_history()
+        if st.session_state.follow_up_questions:
+            st.markdown(st.session_state.follow_up_questions)
 
     # Visualization Tab
     with tabs[2]:
-        if not st.session_state.extracted_text:
-            st.info("Please process a paper first")
+        viz_options = [name for name, option in (("Keyword Cloud", "Extract Keywords"),
+                                                 ("Citations by Year", "Generate Citation Graph"),
+                                                 ("Figures & Tables", "Extract Figures & Tables"))
+                       if option in analysis_options]
+        if not viz_options:
+            st.caption("Enable keywords, citation graph, or figures & tables under Advanced Analysis in the sidebar.")
+            viz_type = None
         else:
-            viz_type = st.radio(
-                "Select visualization type",
-                ["Keyword Cloud", "Citations by Year", "Figures & Tables"]
-            )
+            viz_type = st.radio("Select visualization type", viz_options)
 
-            if viz_type == "Keyword Cloud":
-                st.subheader("Keyword Cloud")
-                word_cloud_data = create_word_cloud_data(st.session_state.extracted_text)
+        if viz_type == "Keyword Cloud":
+            st.subheader("Keyword Cloud")
+            word_cloud_data = create_word_cloud_data(st.session_state.extracted_text)
 
-                if word_cloud_data:
-                    words = [word for word, _ in word_cloud_data]
-                    values = [value for _, value in word_cloud_data]
+            if word_cloud_data:
+                top = word_cloud_data[:15]
+                fig = px.bar(
+                    x=[value for _, value in top],
+                    y=[word for word, _ in top],
+                    orientation='h',
+                    title="Top Keywords by TF-IDF Score",
+                    labels={"x": "Relative Importance", "y": ""}
+                )
+                fig.update_layout(height=500, yaxis={"autorange": "reversed"})
+                st.plotly_chart(fig, width="stretch")
+            else:
+                st.info("Not enough text to generate keyword visualization")
 
-                    fig = px.bar(
-                        x=values[:15],  # Top 15 keywords
-                        y=words[:15],
-                        orientation='h',
-                        title="Top Keywords by TF-IDF Score",
-                        labels={"x": "Relative Importance", "y": ""}
-                    )
-                    fig.update_layout(height=500)
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.info("Not enough text to generate keyword visualization")
+        elif viz_type == "Citations by Year":
+            st.subheader("Citations by Year")
+            citation_data = generate_citation_graph(st.session_state.references)
 
-            elif viz_type == "Citations by Year":
-                st.subheader("Citations by Year")
-                citation_data = generate_citation_graph(st.session_state.references)
+            if citation_data:
+                fig = px.bar(
+                    x=[year for year, _ in citation_data],
+                    y=[count for _, count in citation_data],
+                    title="Citations by Publication Year",
+                    labels={"x": "Year", "y": "Number of Citations"}
+                )
+                st.plotly_chart(fig, width="stretch")
+            else:
+                st.info("Not enough references to generate citation graph")
 
-                if citation_data:
-                    # Create data for the chart
-                    years = [year for year, _ in citation_data]
-                    counts = [count for _, count in citation_data]
+        elif viz_type == "Figures & Tables":
+            st.subheader("Extracted Figures & Tables")
 
-                    # Plot
-                    fig = px.bar(
-                        x=years,
-                        y=counts,
-                        title="Citations by Publication Year",
-                        labels={"x": "Year", "y": "Number of Citations"}
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.info("Not enough references to generate citation graph")
+            if st.session_state.figures:
+                st.write(f"Displaying {len(st.session_state.figures)} extracted figures")
+                cols = st.columns(2)
+                for i, figure in enumerate(st.session_state.figures):
+                    with cols[i % 2]:
+                        st.image(figure["data"], caption=f"Figure from page {figure['page']}", width="stretch")
+            else:
+                st.info("No figures extracted from this document")
 
-            elif viz_type == "Figures & Tables":
-                st.subheader("Extracted Figures & Tables")
-
-                if st.session_state.figures:
-                    st.write(f"Displaying {len(st.session_state.figures)} extracted figures")
-
-                    # Show figures in a grid
-                    cols = st.columns(2)
-                    for i, fig in enumerate(st.session_state.figures):
-                        col_idx = i % 2
-                        with cols[col_idx]:
-                            st.image(
-                                f"data:image/png;base64,{fig['data']}",
-                                caption=f"Figure from page {fig['page']}",
-                                use_container_width =True
-                            )
-                else:
-                    st.info("No figures extracted from this document")
-
-                if st.session_state.tables:
-                    st.write(f"Displaying {len(st.session_state.tables)} potential tables")
-                    for i, table in enumerate(st.session_state.tables):
-                        with st.expander(f"Table from page {table['page']}"):
-                            st.text(table['text'])
-                else:
-                    st.info("No tables detected in this document")
+            if st.session_state.tables:
+                st.write(f"Displaying {len(st.session_state.tables)} detected tables")
+                for table in st.session_state.tables:
+                    with st.expander(f"Table from page {table['page']}"):
+                        st.dataframe(pd.DataFrame(table["rows"]), hide_index=True)
+            else:
+                st.info("No tables detected in this document")
 
     # Export Tab
     with tabs[3]:
         st.subheader("Export Options")
 
-        export_format = st.radio(
-            "Select export format",
-            ["Markdown", "PDF (requires wkhtmltopdf installed)", "JSON"]
-        )
+        if not st.session_state.current_summary:
+            st.info("Generate a summary first. Any analyses and follow-up questions you generate are included too.")
+            return
 
-        if st.button("Export Summary"):
-            if not st.session_state.current_summary:
-                st.warning("Please generate a summary first")
+        title = st.session_state.paper_metadata.get("title") or "Research Paper Summary"
+        base_name = f"{safe_filename(title)}_summary"
+        report = build_report_markdown()
+
+        export_format = st.radio("Select export format", ["Markdown", "PDF", "JSON"], horizontal=True)
+        if export_format == "Markdown":
+            st.download_button("Download Markdown", report, file_name=f"{base_name}.md",
+                               mime="text/markdown", on_click="ignore")
+        elif export_format == "PDF":
+            try:
+                pdf_bytes = markdown_to_pdf(report, title)
+            except Exception as e:
+                st.error(f"Could not create the PDF: {e}")
             else:
-                try:
-                    if export_format == "Markdown":
-                        file_path = save_summary_to_file(
-                            st.session_state.current_summary,
-                            st.session_state.paper_metadata
-                        )
+                st.download_button("Download PDF", pdf_bytes, file_name=f"{base_name}.pdf",
+                                   mime="application/pdf", on_click="ignore")
+        else:
+            st.download_button("Download JSON", build_export_json(), file_name=f"{base_name}.json",
+                               mime="application/json", on_click="ignore")
 
-                        with open(file_path, "r", encoding="utf-8") as f:
-                            file_content = f.read()
-
-                        st.download_button(
-                            label="Download Markdown Summary",
-                            data=file_content,
-                            file_name=file_path.name,
-                            mime="text/markdown"
-                        )
-                        st.success(f"Summary saved as {file_path.name}")
-
-                    elif export_format == "PDF":
-                        st.warning("PDF export requires wkhtmltopdf to be installed on your system")
-                        st.info("This feature would convert the Markdown summary to PDF")
-
-                    elif export_format == "JSON":
-                        # Create JSON with all data we've extracted and generated
-                        export_data = {
-                            "metadata": st.session_state.paper_metadata,
-                            "summary": st.session_state.current_summary,
-                            "keywords": extract_keywords(st.session_state.extracted_text),
-                            "references": st.session_state.references,
-                            "export_date": datetime.now().isoformat()
-                        }
-
-                        # Convert to JSON string
-                        json_str = json.dumps(export_data, indent=2, ensure_ascii=False)
-
-                        # Create download button
-                        title = st.session_state.paper_metadata.get("title", "research_paper")
-                        safe_title = re.sub(r'[^\w\s-]', '', title).strip().replace(' ', '_')
-
-                        st.download_button(
-                            label="Download JSON Data",
-                            data=json_str,
-                            file_name=f"{safe_title}_data.json",
-                            mime="application/json"
-                        )
-                        st.success("JSON data ready for download")
-
-                except Exception as e:
-                    st.error(f"Error exporting summary: {e}")
+        with st.expander("Preview"):
+            st.markdown(report)
 
 
-def _update_history(summary):
-    """Update the history with current paper info"""
-    # Add to history if not already there
-    title = st.session_state.paper_metadata.get("title", "Untitled Paper")
+def _update_history():
+    """Save the current paper and its results to the session history"""
+    entry = {
+        "id": st.session_state.paper_id,
+        "text": st.session_state.extracted_text,
+        "metadata": dict(st.session_state.paper_metadata),
+        "figures": st.session_state.figures,
+        "tables": st.session_state.tables,
+        "references": st.session_state.references,
+        "filename": st.session_state.paper_source,
+        "summary": st.session_state.current_summary,
+        "summary_info": st.session_state.summary_info,
+        "analyses": dict(st.session_state.analyses),
+        "follow_up_questions": st.session_state.follow_up_questions,
+        "timestamp": datetime.now().isoformat()
+    }
 
-    # Check if we already have this paper in history
-    exists = False
-    for paper in st.session_state.history:
-        if paper.get("title") == title:
-            # Update existing entry
-            paper["summary"] = summary
-            paper["metadata"] = st.session_state.paper_metadata
-            paper["figures"] = st.session_state.figures
-            paper["tables"] = st.session_state.tables
-            paper["references"] = st.session_state.references
-            exists = True
-            break
+    history = [h for h in st.session_state.history if h["id"] != entry["id"]]
+    history.append(entry)
 
-    # Add new entry if doesn't exist
-    if not exists:
-        st.session_state.history.append({
-            "title": title,
-            "text": st.session_state.extracted_text,
-            "summary": summary,
-            "metadata": st.session_state.paper_metadata,
-            "figures": st.session_state.figures,
-            "tables": st.session_state.tables,
-            "references": st.session_state.references,
-            "timestamp": datetime.now().isoformat()
-        })
-
-    # Keep only the 10 most recent items
-    if len(st.session_state.history) > 10:
-        st.session_state.history = st.session_state.history[-10:]
+    # Keep only the most recent items
+    st.session_state.history = history[-HISTORY_LIMIT:]
 
 
-# Custom function to handle paper comparison
-def handle_paper_comparison():
+def handle_paper_comparison(model_option):
     """Handle comparing multiple papers"""
-    if not st.session_state.processed_papers:
+    papers = st.session_state.processed_papers
+    if len(papers) < 2:
         return
 
     st.header("Paper Comparison")
 
-    # List available papers
-    paper_options = [f"{i + 1}. {p['metadata'].get('title', p['filename'])}"
-                     for i, p in enumerate(st.session_state.processed_papers)]
-
-    selected = st.multiselect("Select papers to compare", paper_options)
-    if not selected or len(selected) < 2:
-        st.info("Please select at least two papers to compare")
-        return
-
-    comparison_type = st.radio(
-        "Select comparison type",
-        ["Full Comparison", "Methodology Comparison", "Results Comparison"]
+    selected = st.multiselect(
+        "Select papers to compare",
+        range(len(papers)),
+        format_func=lambda i: f"{i + 1}. {papers[i]['metadata'].get('title') or papers[i]['filename']}"
     )
+    comparison_type = st.radio("Select comparison type", list(COMPARISON_FOCUS), horizontal=True)
 
-    if st.button("Compare Selected Papers"):
-        with st.spinner("Comparing papers..."):
-            # Get indices of selected papers
-            indices = [int(s.split('.')[0]) - 1 for s in selected]
-            papers_text = [st.session_state.processed_papers[i]["text"] for i in indices
-                           if i < len(st.session_state.processed_papers)]
+    if len(selected) < 2:
+        st.info("Please select at least two papers to compare")
+    elif st.button("Compare Selected Papers", type="primary"):
+        comparison = run_ai_task(
+            f"Comparing {len(selected)} papers (this summarizes each paper first)...",
+            compare_papers, [papers[i]["text"] for i in selected], model_option, comparison_type
+        )
+        if comparison:
+            st.session_state.comparison = comparison
 
-            # Generate comparison based on type
-            if comparison_type == "Full Comparison":
-                comparison = compare_papers(papers_text)
-            else:
-                # For more specific comparisons, we could implement custom prompts
-                comparison = compare_papers(papers_text)
-
-            st.markdown(comparison)
-
-            # Option to save comparison
-            st.download_button(
-                "Download Comparison",
-                comparison,
-                file_name="paper_comparison.md",
-                mime="text/markdown"
-            )
+    if st.session_state.comparison:
+        st.markdown(st.session_state.comparison)
+        st.download_button(
+            "Download Comparison",
+            st.session_state.comparison,
+            file_name="paper_comparison.md",
+            mime="text/markdown",
+            on_click="ignore"
+        )
 
 
 # Main application function
 def main():
     # Display header
-    st.markdown('<div class="main-header">Advanced Research Paper Summarizer</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="main-header">{APP_TITLE}</div>', unsafe_allow_html=True)
     st.markdown(
         "Upload academic papers to generate summaries, extract key information, and visualize content using Gemini AI."
     )
@@ -1195,17 +1361,18 @@ def main():
     col1, col2 = st.columns([1, 1])
 
     with col1:
-        input_text, multiple_papers = render_input_panel()
+        input_method = render_input_panel(model_option)
 
     with col2:
         render_output_panel(model_option, summary_type, analysis_options)
 
     # Handle paper comparison if multiple papers uploaded
-    if multiple_papers:
-        handle_paper_comparison()
+    if input_method == "Upload Multiple PDFs":
+        handle_paper_comparison(model_option)
 
     # Footer
     st.divider()
+
 
 if __name__ == "__main__":
     main()
