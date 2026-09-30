@@ -60,6 +60,8 @@ ANALYSIS_OPTIONS = {
     "Generate Citation Graph": None,
 }
 
+SAMPLE_PAPER = {"arxiv_id": "1706.03762", "label": "Attention Is All You Need (2017)"}
+
 COMPARISON_FOCUS = {
     "Full Comparison": "",
     "Methodology Comparison": "Concentrate on how the research designs, data, and methods differ and which is more rigorous.",
@@ -995,6 +997,18 @@ def render_input_panel(model_option):
     """Render the input section and return the selected input method"""
     st.header("Paper Input")
 
+    if st.button(f"Try a sample paper: {SAMPLE_PAPER['label']}", icon=":material/science:",
+                 help="Downloads the paper from arXiv so you can try the app without your own PDF."):
+        with st.spinner("Downloading sample paper from arXiv..."):
+            try:
+                paper = lookup_paper(SAMPLE_PAPER["arxiv_id"], model_option)
+            except (PaperLookupError, ValueError) as e:
+                st.error(f"Could not load the sample paper: {e}")
+                paper = None
+        if paper:
+            load_paper(paper)
+            st.success("Sample paper loaded. Click Generate Summary to try it out.")
+
     upload_option = st.radio("Choose input method:",
                              ["Upload PDF", "Paste Text", "Upload Multiple PDFs", "DOI / arXiv Lookup"])
 
@@ -1109,7 +1123,7 @@ def render_output_panel(model_option, summary_type, analysis_options):
         if st.session_state.processed_papers:
             st.info("Open one of the uploaded papers to analyze it, or compare papers below.")
         else:
-            st.info("Please upload or paste a research paper to analyze")
+            st.info("Please upload or paste a research paper to analyze, or try the sample paper")
         return
 
     # Tab-based interface for different outputs

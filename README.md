@@ -47,6 +47,9 @@ streamlit run app.py
 The app opens at http://localhost:8501. If you have no `.env` file, you can paste an API key into
 the sidebar; it is used only for the current session.
 
+To try the app without your own PDF, click **Try a sample paper**. It downloads
+*Attention Is All You Need* (Vaswani et al., 2017) from arXiv. Then click **Generate Summary**.
+
 ## Configuration
 
 Set these in `.env`. Only `GOOGLE_API_KEY` is required.
