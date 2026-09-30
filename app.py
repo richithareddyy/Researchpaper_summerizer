@@ -82,6 +82,7 @@ CHAT_STARTERS = [
 ]
 
 SAMPLE_PAPER = {"arxiv_id": "1706.03762", "label": "Attention Is All You Need (2017)"}
+SAMPLE_COMPARISON = {"arxiv_ids": ["1706.03762", "1810.04805"], "label": "Attention Is All You Need vs. BERT"}
 
 COMPARISON_FOCUS = {
     "Full Comparison": "",
@@ -114,6 +115,7 @@ SESSION_DEFAULTS = {
     "follow_up_questions": "",
     "comparison": "",
     "chat_messages": [],
+    "sample_comparison": [],
     "study_aids": None,
     "last_upload_id": None,
     "paper_cache": {},
@@ -1262,6 +1264,24 @@ def render_sidebar():
     return model_option, summary_type, analysis_options
 
 
+def load_sample_comparison():
+    samples = []
+    for i, arxiv_id in enumerate(SAMPLE_COMPARISON["arxiv_ids"]):
+        with st.spinner(f"Downloading sample paper {i + 1} of {len(SAMPLE_COMPARISON['arxiv_ids'])} from arXiv..."):
+            try:
+                samples.append(lookup_paper(arxiv_id))
+            except (PaperLookupError, ValueError) as e:
+                st.error(f"Could not load the sample papers: {e}")
+                return
+    st.session_state.sample_comparison = samples
+    st.rerun()
+
+
+def _clear_sample_comparison():
+    st.session_state.sample_comparison = []
+    st.session_state.comparison = ""
+
+
 def render_input_panel(model_option):
     """Render the input section and return the selected input method"""
     st.header("Paper Input")
@@ -1326,6 +1346,16 @@ def render_input_panel(model_option):
                     papers.append(process_pdf(file.getvalue(), file.name))
                 except ValueError as e:
                     st.error(f"Error processing {file.name}: {e}")
+
+        if st.session_state.sample_comparison:
+            st.caption("Sample papers: " + ", ".join(p["metadata"].get("title") or p["filename"]
+                                                     for p in st.session_state.sample_comparison))
+            st.button("Remove Sample Papers", on_click=_clear_sample_comparison)
+        elif not uploaded_files:
+            if st.button(f"Try sample papers: {SAMPLE_COMPARISON['label']}", icon=":material/science:",
+                         help="Downloads two related papers from arXiv so you can try comparing without your own PDFs."):
+                load_sample_comparison()
+        papers += st.session_state.sample_comparison
         st.session_state.processed_papers = papers
 
         if papers:
@@ -1716,6 +1746,7 @@ def handle_paper_comparison(model_option):
     selected = st.multiselect(
         "Select papers to compare",
         range(len(papers)),
+        default=list(range(len(papers))) if len(papers) <= 3 else None,
         format_func=lambda i: f"{i + 1}. {papers[i]['metadata'].get('title') or papers[i]['filename']}"
     )
     comparison_type = st.radio("Select comparison type", list(COMPARISON_FOCUS), horizontal=True)

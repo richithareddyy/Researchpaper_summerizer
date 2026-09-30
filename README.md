@@ -2,32 +2,34 @@
 
 ### Read, compare and explore academic papers
 
-Turn a PDF, pasted text or DOI/arXiv link into structured summaries, methodology insights and exportable research notes. Built with **Python · Streamlit · Gemini · PyMuPDF**.
+Turn a PDF, pasted text or DOI/arXiv link into structured summaries, methodology insights, a chat you can question, study aids and exportable research notes. Built with **Python · Streamlit · Gemini · PyMuPDF**.
 
 [Get started](#setup) · [Features](#features) · [Configuration](#configuration) · [Limitations](#limitations)
 
 ## At a glance
 
-| Bring a paper | Explore the research | Take the results with you |
+| Bring a paper | Explore the research | Learn and take it with you |
 | --- | --- | --- |
-| PDF upload, pasted text, DOI or arXiv lookup | Summary styles, methodology, figures, tables and comparisons | Markdown, PDF and JSON reports |
+| PDF upload, pasted text, DOI or arXiv lookup, or built-in sample papers | Streaming summaries, chat with the paper, methodology, figures, tables and comparisons | Glossary and flashcards, APA/MLA/BibTeX citations, Markdown, PDF and JSON reports |
 
 ## Workflow
 
 1. **Load** a paper, or select **Try a sample paper**.
 2. **Choose** a summary style and optional analyses in the sidebar.
-3. **Explore** the summary, research questions and extracted content.
-4. **Compare or export** findings for further reading.
+3. **Explore** the summary, chat with the paper, and browse its figures, tables and references.
+4. **Study** with the glossary and flashcards, and copy a citation.
+5. **Compare or export** findings for further reading. Try **Upload Multiple PDFs → Try sample papers**
+   to compare two papers without your own files.
 
 ## Features
 
 - **Input methods**
   - Upload a single PDF
   - Paste text
-  - Upload several PDFs and compare them
+  - Upload several PDFs and compare them, or load two sample papers to compare
   - Look up a paper by DOI or arXiv ID/URL. arXiv papers are downloaded in full. For other
     DOIs the app uses the open-access PDF when Crossref lists one, and otherwise the abstract.
-- **Summaries**: comprehensive, executive, technical, critique, or "explain like I'm 5"
+- **Summaries**: comprehensive, executive, technical, critique, or "explain like I'm 5", shown as they are written
 - **Detailed analysis**: methodology, literature context, future research, and practical applications
 - **Follow-up questions**: research questions the paper raises
 - **Chat with the paper**: ask questions and get answers based on the paper's text, with starter questions to get going
@@ -36,7 +38,7 @@ Turn a PDF, pasted text or DOI/arXiv link into structured summaries, methodology
 - **Metadata**: title, authors, year, venue, and DOI (from the PDF, Gemini, Crossref, or arXiv)
 - **Extraction**: references, embedded figures, and tables (via PyMuPDF table detection)
 - **Visualizations**: TF-IDF keywords, citations by year, and a figure/table gallery
-- **Paper comparison**: full, methodology-focused, or results-focused
+- **Paper comparison**: full, methodology-focused, or results-focused; papers are summarized in parallel
 - **Export**: a report with the summary, analyses, questions, chat, study aids, and citation, as Markdown, PDF, or JSON
 - **History**: reopen the last 10 papers from this session, including their results
 
@@ -68,6 +70,9 @@ tables, and references.
 
 To try the app without your own PDF, click **Try a sample paper**. It downloads
 *Attention Is All You Need* (Vaswani et al., 2017) from arXiv. Then click **Generate Summary**.
+
+To try a comparison, choose **Upload Multiple PDFs** and click **Try sample papers**. It downloads
+*Attention Is All You Need* and *BERT* (Devlin et al., 2018) from arXiv, ready to compare.
 
 ## Configuration
 
