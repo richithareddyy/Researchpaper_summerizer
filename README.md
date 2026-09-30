@@ -15,7 +15,7 @@ Turn a PDF, pasted text or DOI/arXiv link into structured summaries, methodology
 ## Workflow
 
 1. **Load** a paper, or select **Try a sample paper**.
-2. **Choose** a summary style and optional analyses in the sidebar.
+2. **Choose** a summary type next to **Generate Summary**, and optional sections in the sidebar.
 3. **Explore** the summary, chat with the paper, and browse its figures, tables and references.
 4. **Study** with the glossary and flashcards, and copy a citation.
 5. **Compare or export** findings for further reading. Try **Upload Multiple PDFs → Try sample papers**
@@ -42,7 +42,7 @@ Turn a PDF, pasted text or DOI/arXiv link into structured summaries, methodology
 - **Export**: a report with the summary, analyses, questions, chat, study aids, and citation, as Markdown, PDF, or JSON
 - **History**: reopen the last 10 papers from this session, including their results
 
-Use **Advanced Analysis** in the sidebar to choose which analyses and visualizations appear.
+Use **Sections** in the sidebar to choose which analyses and visualizations appear.
 
 ## Requirements
 
@@ -88,6 +88,11 @@ Set these in `.env`. Only `GOOGLE_API_KEY` is required.
 | `CROSSREF_MAILTO` | — | Optional contact email sent to Crossref/arXiv, as their API etiquette asks |
 
 For Streamlit Community Cloud, put `GOOGLE_API_KEY` in the app's secrets instead of `.env`.
+
+The app's look (colors, fonts, corner radius, status and chart colors) is set in
+`.streamlit/config.toml`. A small CSS block near the top of `app.py` handles what the theme can't,
+such as section headings, focus outlines, and the reading width for generated text. It uses the same
+colors, defined once in `DESIGN_TOKENS`.
 
 ## Limitations
 

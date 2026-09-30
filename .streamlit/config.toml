@@ -1,9 +1,32 @@
+# Design tokens for the whole app: ink on paper, serif headings like a printed paper,
+# one warm accent. app.py (DESIGN_TOKENS) mirrors the colors used by its CSS layer and charts.
 [theme]
 base = "light"
-primaryColor = "#4F46E5"
+primaryColor = "#23272F"
 backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#F3F4F8"
-textColor = "#1F2937"
+secondaryBackgroundColor = "#F6F4EF"
+textColor = "#1D2127"
+linkColor = "#9A3F1C"
+borderColor = "#E4E0D8"
+showWidgetBorder = true
+baseRadius = "0.25rem"
+buttonRadius = "0.25rem"
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap"
+headingFont = "Source Serif 4:https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap"
+headingFontWeights = [600, 600, 600, 600, 600, 600]
+headingFontSizes = ["1.9rem", "1.3rem", "1.05rem", "0.95rem", "0.9rem", "0.85rem"]
+redColor = "#B42318"
+orangeColor = "#A5520F"
+yellowColor = "#8A6100"
+greenColor = "#2E6B47"
+blueColor = "#3F5873"
+violetColor = "#6B4E7A"
+grayColor = "#646A73"
+chartCategoricalColors = ["#9A3F1C", "#3F5873", "#6B7A3A", "#B7862B", "#2F6F6B", "#6B4E7A"]
+
+[theme.sidebar]
+backgroundColor = "#FAF8F4"
+secondaryBackgroundColor = "#FFFFFF"
 
 [client]
 toolbarMode = "minimal"
