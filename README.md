@@ -77,6 +77,7 @@ Set these in `.env`. Only `GOOGLE_API_KEY` is required.
 |---|---|---|
 | `GOOGLE_API_KEY` | — | Gemini API key (`GEMINI_API_KEY` also works) |
 | `GEMINI_MODEL` | `gemini-flash-latest` | Default model. The sidebar also lists every Gemini text model your key can use. |
+| `GEMINI_FAST_MODEL` | `gemini-flash-lite-latest` | Faster model for quick background tasks, such as reading a paper's title and authors on upload |
 | `MAX_INPUT_CHARS` | `400000` | Maximum characters of paper text sent to the model |
 | `MAX_DOWNLOAD_MB` | `50` | Size limit for PDFs downloaded during DOI/arXiv lookup |
 | `CROSSREF_MAILTO` | — | Optional contact email sent to Crossref/arXiv, as their API etiquette asks |

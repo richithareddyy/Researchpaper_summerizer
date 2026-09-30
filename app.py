@@ -1,10 +1,13 @@
 import csv
 import hashlib
 import io
+import itertools
 import json
 import os
 import re
+import threading
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from urllib.parse import quote
 
@@ -19,6 +22,7 @@ from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
 from sklearn.feature_extraction.text import TfidfVectorizer
+from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
 # Load environment variables
 load_dotenv()
@@ -27,6 +31,8 @@ APP_TITLE = "Advanced Research Paper Summarizer"
 
 # Configuration (override any of these in .env)
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+# Quick background tasks such as reading a paper's title and authors
+FAST_MODEL = os.getenv("GEMINI_FAST_MODEL", "gemini-flash-lite-latest")
 # Tried in order when the selected model is out of quota or overloaded
 FALLBACK_MODELS = ["gemini-flash-latest", "gemini-flash-lite-latest"]
 # Hidden from the model picker: previews often have no free quota, the rest aren't text models
@@ -122,6 +128,10 @@ st.markdown("""
     .main-header {color: #1E88E5; font-size: 40px; font-weight: bold; margin-bottom: 20px; text-align: center;}
 </style>
 """, unsafe_allow_html=True)
+
+
+EMPTY_RESPONSE_MESSAGE = ("The model returned an empty response. It may have been blocked by safety filters; "
+                          "try another summary type or model.")
 
 
 class GeminiError(Exception):
@@ -336,7 +346,7 @@ def get_api_key():
 def get_client(api_key):
     # Retry temporary server failures with exponential backoff; quota errors (429)
     # are not retried here because call_gemini switches to a fallback model instead
-    retry = types.HttpRetryOptions(attempts=3, initial_delay=2, max_delay=10,
+    retry = types.HttpRetryOptions(attempts=2, initial_delay=2, max_delay=5,
                                    http_status_codes=[500, 502, 503, 504])
     return genai.Client(api_key=api_key, http_options=types.HttpOptions(retry_options=retry))
 
@@ -379,21 +389,18 @@ def _describe_api_error(error, model_name):
     return f"Gemini API error ({code}): {message}"
 
 
-def call_gemini(prompt, model_name, json_output=False):
-    """Send a prompt to Gemini and return the response text."""
+def _with_fallback(model_name, send):
+    """Run send(client, model), switching to a fallback model on quota or availability errors."""
     api_key = get_api_key()
     if not api_key:
         raise GeminiError("No Google API key configured. Add GOOGLE_API_KEY to your .env file (or the app's Secrets when deployed).")
 
-    config = types.GenerateContentConfig(response_mime_type="application/json") if json_output else None
     model_name = model_name.removeprefix("models/")
     candidates = [model_name] + [m for m in FALLBACK_MODELS if m != model_name]
     first_error = None
     for candidate in candidates:
         try:
-            response = get_client(api_key).models.generate_content(
-                model=candidate, contents=prompt, config=config
-            )
+            result = send(get_client(api_key), candidate)
         except genai_errors.APIError as e:
             # Out of quota, overloaded, or unavailable: try the next model
             if getattr(e, "code", None) in (404, 429, 500, 502, 503, 504):
@@ -404,22 +411,50 @@ def call_gemini(prompt, model_name, json_output=False):
             raise GeminiError(f"Could not reach the Gemini API: {e}") from e
         if candidate != model_name:
             st.toast(f"{model_name} was unavailable, so {candidate} was used instead.")
-        break
-    else:
-        message = _describe_api_error(first_error, model_name)
-        if len(candidates) > 1:
-            message += (f" The backup models ({', '.join(candidates[1:])}) were unavailable too, so this is "
-                        "most likely a limit on your API key rather than on one model.")
-        raise GeminiError(message) from first_error
+        return result
 
+    message = _describe_api_error(first_error, model_name)
+    if len(candidates) > 1:
+        message += (f" The backup models ({', '.join(candidates[1:])}) were unavailable too, so this is "
+                    "most likely a limit on your API key rather than on one model.")
+    raise GeminiError(message) from first_error
+
+
+def call_gemini(prompt, model_name, json_output=False):
+    """Send a prompt to Gemini and return the whole response text."""
+    config = types.GenerateContentConfig(response_mime_type="application/json") if json_output else None
+    response = _with_fallback(
+        model_name, lambda client, model: client.models.generate_content(model=model, contents=prompt, config=config)
+    )
     text = response.text
     if not text or not text.strip():
-        raise GeminiError("The model returned an empty response. It may have been blocked by safety filters; try another summary type or model.")
+        raise GeminiError(EMPTY_RESPONSE_MESSAGE)
     return text.strip()
 
 
+def stream_gemini(prompt, model_name):
+    """Send a prompt to Gemini and return a generator of text chunks as they arrive."""
+    def start(client, model):
+        chunks = iter(client.models.generate_content_stream(model=model, contents=prompt))
+        return chunks, next(chunks, None)  # the request is sent here, so errors can trigger a fallback
+
+    chunks, first = _with_fallback(model_name, start)
+
+    def text_chunks():
+        try:
+            for chunk in itertools.chain([first] if first else [], chunks):
+                if chunk.text:
+                    yield chunk.text
+        except genai_errors.APIError as e:
+            raise GeminiError(_describe_api_error(e, model_name)) from e
+        except Exception as e:
+            raise GeminiError(f"The response was interrupted: {e}") from e
+
+    return text_chunks()
+
+
 # Define functions for generating summaries using Gemini API
-def generate_summary(text, model_name=DEFAULT_MODEL, summary_type="comprehensive"):
+def generate_summary(text, model_name=DEFAULT_MODEL, summary_type="comprehensive", stream=False):
     """Generate paper summary using Gemini API"""
     text, _ = prepare_text_for_model(text)
 
@@ -508,10 +543,10 @@ def generate_summary(text, model_name=DEFAULT_MODEL, summary_type="comprehensive
         """
     }
 
-    return call_gemini(prompts[summary_type], model_name)
+    return (stream_gemini if stream else call_gemini)(prompts[summary_type], model_name)
 
 
-def generate_detailed_analysis(text, model_name=DEFAULT_MODEL, analysis_type="methodology"):
+def generate_detailed_analysis(text, model_name=DEFAULT_MODEL, analysis_type="methodology", stream=False):
     """Generate detailed analysis of specific aspects of the paper"""
     text, _ = prepare_text_for_model(text)
 
@@ -586,10 +621,10 @@ def generate_detailed_analysis(text, model_name=DEFAULT_MODEL, analysis_type="me
         """
     }
 
-    return call_gemini(prompts[analysis_type], model_name)
+    return (stream_gemini if stream else call_gemini)(prompts[analysis_type], model_name)
 
 
-def generate_follow_up_questions(text, model_name=DEFAULT_MODEL):
+def generate_follow_up_questions(text, model_name=DEFAULT_MODEL, stream=False):
     """Generate insightful follow-up questions about the paper"""
     text, _ = prepare_text_for_model(text)
 
@@ -605,7 +640,7 @@ def generate_follow_up_questions(text, model_name=DEFAULT_MODEL):
     Format your response as a numbered list in Markdown.
     """
 
-    return call_gemini(prompt, model_name)
+    return (stream_gemini if stream else call_gemini)(prompt, model_name)
 
 
 def _parse_json_object(raw, what):
@@ -670,11 +705,16 @@ def compare_papers(papers_text, model_name=DEFAULT_MODEL, comparison_type="Full 
     if len(papers_text) < 2:
         raise ValueError("Need at least two papers to compare")
 
-    # Create summaries of each paper first to reduce token usage
-    summaries = []
-    for i, text in enumerate(papers_text):
-        brief_summary = generate_summary(text, model_name, "executive")
-        summaries.append(f"Paper {i + 1}:\n{brief_summary}")
+    # Summarize each paper first (in parallel) to keep the comparison prompt small
+    ctx = get_script_run_ctx()
+
+    def summarize(text):
+        add_script_run_ctx(threading.current_thread(), ctx)  # lets worker threads show notices
+        return generate_summary(text, model_name, "executive")
+
+    with ThreadPoolExecutor(max_workers=min(4, len(papers_text))) as pool:
+        briefs = list(pool.map(summarize, papers_text))
+    summaries = [f"Paper {i + 1}:\n{brief}" for i, brief in enumerate(briefs)]
 
     combined_summaries = "\n\n".join(summaries)
     focus = COMPARISON_FOCUS.get(comparison_type, "")
@@ -702,7 +742,7 @@ def compare_papers(papers_text, model_name=DEFAULT_MODEL, comparison_type="Full 
     return call_gemini(prompt, model_name)
 
 
-def answer_question(text, question, chat_history, model_name=DEFAULT_MODEL):
+def answer_question(text, question, chat_history, model_name=DEFAULT_MODEL, stream=False):
     """Answer a question about the paper, using recent chat turns as context"""
     text, _ = prepare_text_for_model(text)
     recent = chat_history[-CHAT_HISTORY_TURNS * 2:]
@@ -727,7 +767,7 @@ def answer_question(text, question, chat_history, model_name=DEFAULT_MODEL):
     Question: {question}
     """
 
-    return call_gemini(prompt, model_name)
+    return (stream_gemini if stream else call_gemini)(prompt, model_name)
 
 
 def generate_study_aids(text, model_name=DEFAULT_MODEL):
@@ -874,12 +914,12 @@ def build_paper(text, metadata, figures=None, tables=None, source=""):
     }
 
 
-def enrich_metadata(paper, model_name):
-    """Fill in title/authors/etc. with Gemini. Failures are non-fatal."""
+def enrich_metadata(paper):
+    """Fill in title/authors/etc. with Gemini's fast model. Failures are non-fatal."""
     if not get_api_key():
         return
     try:
-        ai_metadata = extract_paper_details(paper["text"], model_name)
+        ai_metadata = extract_paper_details(paper["text"], FAST_MODEL)
     except GeminiError as e:
         st.caption(f"Could not extract paper details automatically: {e}")
         return
@@ -888,7 +928,7 @@ def enrich_metadata(paper, model_name):
             paper["metadata"][key] = value
 
 
-def process_pdf(pdf_bytes, filename, model_name):
+def process_pdf(pdf_bytes, filename):
     """Extract a PDF once per session; later calls reuse the cached result."""
     pid = paper_id_for(pdf_bytes)
     cache = st.session_state.paper_cache
@@ -900,7 +940,7 @@ def process_pdf(pdf_bytes, filename, model_name):
         raise ValueError("No selectable text was found. The PDF may be a scanned image; OCR is not supported.")
 
     paper = build_paper(text, metadata, figures, tables, filename)
-    enrich_metadata(paper, model_name)
+    enrich_metadata(paper)
     cache[pid] = paper
     return paper
 
@@ -1008,7 +1048,7 @@ ARXIV_PATTERN = re.compile(
 DOI_PATTERN = re.compile(r'(10\.\d{4,9}/\S+)')
 
 
-def lookup_paper(identifier, model_name):
+def lookup_paper(identifier):
     """Fetch a paper by arXiv ID/URL or DOI."""
     identifier = identifier.strip()
     if not identifier:
@@ -1021,7 +1061,7 @@ def lookup_paper(identifier, model_name):
             pdf_bytes = _download(f"https://arxiv.org/pdf/{arxiv_id}", accept_pdf_only=True, include_contact=True)
         except requests.exceptions.RequestException as e:
             raise PaperLookupError(f"Could not download arXiv paper {arxiv_id}: {e}") from e
-        paper = process_pdf(pdf_bytes, f"arXiv:{arxiv_id}", model_name)
+        paper = process_pdf(pdf_bytes, f"arXiv:{arxiv_id}")
         try:
             metadata = fetch_arxiv_metadata(arxiv_id)
             paper["metadata"].update({k: v for k, v in metadata.items() if v})
@@ -1040,7 +1080,7 @@ def lookup_paper(identifier, model_name):
         if link.get("content-type") == "application/pdf" and link.get("URL"):
             try:
                 pdf_bytes = _download(link["URL"], accept_pdf_only=True)
-                paper = process_pdf(pdf_bytes, f"doi:{doi}", model_name)
+                paper = process_pdf(pdf_bytes, f"doi:{doi}")
                 paper["metadata"].update({k: v for k, v in metadata.items() if v})
                 return paper
             except (requests.exceptions.RequestException, PaperLookupError, ValueError):
@@ -1230,7 +1270,7 @@ def render_input_panel(model_option):
                  help="Downloads the paper from arXiv so you can try the app without your own PDF."):
         with st.spinner("Downloading sample paper from arXiv..."):
             try:
-                paper = lookup_paper(SAMPLE_PAPER["arxiv_id"], model_option)
+                paper = lookup_paper(SAMPLE_PAPER["arxiv_id"])
             except (PaperLookupError, ValueError) as e:
                 st.error(f"Could not load the sample paper: {e}")
                 paper = None
@@ -1252,7 +1292,7 @@ def render_input_panel(model_option):
             if upload_id != st.session_state.last_upload_id:
                 with st.spinner("Extracting text and content from PDF..."):
                     try:
-                        paper = process_pdf(pdf_bytes, uploaded_file.name, model_option)
+                        paper = process_pdf(pdf_bytes, uploaded_file.name)
                     except ValueError as e:
                         st.error(f"Error processing PDF: {e}")
                         return upload_option
@@ -1272,7 +1312,7 @@ def render_input_panel(model_option):
             else:
                 paper = build_paper(pasted.strip(), {}, source="Pasted text")
                 with st.spinner("Reading paper details..."):
-                    enrich_metadata(paper, model_option)
+                    enrich_metadata(paper)
                 load_paper(paper)
                 st.success("Text loaded.")
 
@@ -1283,7 +1323,7 @@ def render_input_panel(model_option):
         for i, file in enumerate(uploaded_files or []):
             with st.spinner(f"Processing file {i + 1}/{len(uploaded_files)}..."):
                 try:
-                    papers.append(process_pdf(file.getvalue(), file.name, model_option))
+                    papers.append(process_pdf(file.getvalue(), file.name))
                 except ValueError as e:
                     st.error(f"Error processing {file.name}: {e}")
         st.session_state.processed_papers = papers
@@ -1310,7 +1350,7 @@ def render_input_panel(model_option):
         if submitted:
             with st.spinner("Looking up paper..."):
                 try:
-                    paper = lookup_paper(identifier, model_option)
+                    paper = lookup_paper(identifier)
                 except (PaperLookupError, ValueError) as e:
                     st.error(str(e))
                     return upload_option
@@ -1332,6 +1372,23 @@ def render_input_panel(model_option):
                        "(set MAX_INPUT_CHARS in .env to change this).")
 
     return upload_option
+
+
+def run_ai_stream(label, func, *args):
+    """Show a Gemini response as it is written; return the full text, or None on failure."""
+    try:
+        with st.spinner(label):
+            chunks = func(*args, stream=True)
+        text = st.write_stream(chunks)
+    except GeminiError as e:
+        st.error(str(e))
+        return None
+    if not isinstance(text, str):
+        text = "".join(str(part) for part in text or [])
+    if not text.strip():
+        st.error(EMPTY_RESPONSE_MESSAGE)
+        return None
+    return text.strip()
 
 
 def run_ai_task(label, func, *args):
@@ -1362,7 +1419,7 @@ def render_output_panel(model_option, summary_type, analysis_options):
     with tabs[0]:
         label = "Generate New Summary" if st.session_state.current_summary else "Generate Summary"
         if st.button(label, type="primary"):
-            summary = run_ai_task("Generating summary with Gemini AI...", generate_summary,
+            summary = run_ai_stream("Generating summary with Gemini AI...", generate_summary,
                                   st.session_state.extracted_text, model_option, summary_type)
             if summary:
                 st.session_state.current_summary = summary
@@ -1421,11 +1478,12 @@ def render_output_panel(model_option, summary_type, analysis_options):
         if available:
             analysis_type = st.selectbox("Select analysis type", available, format_func=ANALYSIS_TYPES.get)
             if st.button("Generate Analysis"):
-                result = run_ai_task("Generating detailed analysis...", generate_detailed_analysis,
-                                     st.session_state.extracted_text, model_option, analysis_type)
+                result = run_ai_stream("Generating detailed analysis...", generate_detailed_analysis,
+                                       st.session_state.extracted_text, model_option, analysis_type)
                 if result:
                     st.session_state.analyses[analysis_type] = result
                     _update_history()
+                    st.rerun()
             for key, result in st.session_state.analyses.items():
                 with st.expander(f"{ANALYSIS_TYPES[key]} Analysis", expanded=(key == analysis_type)):
                     st.markdown(result)
@@ -1435,11 +1493,12 @@ def render_output_panel(model_option, summary_type, analysis_options):
         # Follow-up questions
         st.subheader("Research Questions")
         if st.button("Generate Follow-up Questions"):
-            questions = run_ai_task("Generating questions...", generate_follow_up_questions,
-                                    st.session_state.extracted_text, model_option)
+            questions = run_ai_stream("Generating questions...", generate_follow_up_questions,
+                                      st.session_state.extracted_text, model_option)
             if questions:
                 st.session_state.follow_up_questions = questions
                 _update_history()
+                st.rerun()
         if st.session_state.follow_up_questions:
             st.markdown(st.session_state.follow_up_questions)
 
@@ -1573,8 +1632,8 @@ def render_chat(model_option):
         with st.chat_message("user"):
             st.markdown(question)
         with st.chat_message("assistant"):
-            answer = run_ai_task("Reading the paper...", answer_question,
-                                 st.session_state.extracted_text, question, messages, model_option)
+            answer = run_ai_stream("Reading the paper...", answer_question,
+                                   st.session_state.extracted_text, question, messages, model_option)
         if answer:
             st.session_state.chat_messages = messages + [
                 {"role": "user", "content": question},
@@ -1665,7 +1724,7 @@ def handle_paper_comparison(model_option):
         st.info("Please select at least two papers to compare")
     elif st.button("Compare Selected Papers", type="primary"):
         comparison = run_ai_task(
-            f"Comparing {len(selected)} papers (this summarizes each paper first)...",
+            f"Comparing {len(selected)} papers (each is summarized first, in parallel)...",
             compare_papers, [papers[i]["text"] for i in selected], model_option, comparison_type
         )
         if comparison:
