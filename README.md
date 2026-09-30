@@ -1,8 +1,23 @@
 # Research Paper Summarizer
 
-A Streamlit app that summarizes and analyzes academic papers with Google's Gemini API.
-Load a paper as a PDF, as pasted text, or by DOI/arXiv ID. The app can then generate
-summaries and analyses, extract figures, tables and references, and export the results.
+### Read, compare and explore academic papers
+
+Turn a PDF, pasted text or DOI/arXiv link into structured summaries, methodology insights and exportable research notes. Built with **Python · Streamlit · Gemini · PyMuPDF**.
+
+[Get started](#setup) · [Features](#features) · [Configuration](#configuration) · [Limitations](#limitations)
+
+## At a glance
+
+| Bring a paper | Explore the research | Take the results with you |
+| --- | --- | --- |
+| PDF upload, pasted text, DOI or arXiv lookup | Summary styles, methodology, figures, tables and comparisons | Markdown, PDF and JSON reports |
+
+## Workflow
+
+1. **Load** a paper, or select **Try a sample paper**.
+2. **Choose** a summary style and optional analyses in the sidebar.
+3. **Explore** the summary, research questions and extracted content.
+4. **Compare or export** findings for further reading.
 
 ## Features
 
