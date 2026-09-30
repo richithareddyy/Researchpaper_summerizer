@@ -22,7 +22,7 @@ summaries and analyses, extract figures, tables and references, and export the r
 - **Export**: a report with the summary, analyses and questions, as Markdown, PDF, or JSON
 - **History**: reopen the last 10 papers from this session, including their results
 
-Use **Sections to show** in the sidebar to choose which analyses and visualizations appear.
+Use **Advanced Analysis** in the sidebar to choose which analyses and visualizations appear.
 
 ## Requirements
 
@@ -45,12 +45,8 @@ streamlit run app.py
 ```
 
 The app opens at http://localhost:8501 and reads your key from `.env` automatically. If no key is
-found, the app shows setup instructions; you can still load papers and browse their figures,
+found, the sidebar explains how to add one; you can still load papers and browse their figures,
 tables, and references.
-
-The page walks you through three steps: **choose a paper**, check the **paper card** (title,
-authors, counts, and keywords), then **explore the results** in the Summary, Deep Dive, Visuals,
-and Export tabs.
 
 To try the app without your own PDF, click **Try a sample paper**. It downloads
 *Attention Is All You Need* (Vaswani et al., 2017) from arXiv. Then click **Generate Summary**.
