@@ -90,3 +90,7 @@ For Streamlit Community Cloud, put `GOOGLE_API_KEY` in the app's secrets instead
   the paper's layout.
 - Many publisher DOIs have no open full text. For those, download the PDF and upload it.
 - Every AI feature needs a valid Gemini API key and uses your API quota.
+- Free-tier keys have daily and per-minute limits for each model. If the selected model is out of
+  quota or overloaded, the app automatically retries with `gemini-flash-latest` and then
+  `gemini-flash-lite-latest`. Preview and experimental models are hidden from the model list
+  because they often have no free quota.

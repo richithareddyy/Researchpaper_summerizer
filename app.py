@@ -27,6 +27,10 @@ APP_TITLE = "Advanced Research Paper Summarizer"
 
 # Configuration (override any of these in .env)
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+# Tried in order when the selected model is out of quota or overloaded
+FALLBACK_MODELS = ["gemini-flash-latest", "gemini-flash-lite-latest"]
+# Hidden from the model picker: previews often have no free quota, the rest aren't text models
+HIDDEN_MODEL_TAGS = ("preview", "exp", "tts", "image", "live", "audio", "embedding", "robotics", "computer-use")
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "400000"))
 MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", "50"))
 REQUEST_TIMEOUT = 30
@@ -330,9 +334,10 @@ def get_api_key():
 
 @st.cache_resource(show_spinner=False)
 def get_client(api_key):
-    # Retry temporary failures (rate limits, overloaded models) with exponential backoff
-    retry = types.HttpRetryOptions(attempts=4, initial_delay=2, max_delay=20,
-                                   http_status_codes=[429, 500, 502, 503, 504])
+    # Retry temporary server failures with exponential backoff; quota errors (429)
+    # are not retried here because call_gemini switches to a fallback model instead
+    retry = types.HttpRetryOptions(attempts=3, initial_delay=2, max_delay=10,
+                                   http_status_codes=[500, 502, 503, 504])
     return genai.Client(api_key=api_key, http_options=types.HttpOptions(retry_options=retry))
 
 
@@ -344,20 +349,30 @@ def list_available_models(api_key):
         name = (model.name or "").removeprefix("models/")
         actions = model.supported_actions or []
         if (name.startswith("gemini") and "generateContent" in actions
-                and not any(tag in name for tag in ("tts", "image", "live", "audio", "embedding"))):
+                and not any(tag in name for tag in HIDDEN_MODEL_TAGS)):
             names.add(name)
-    return sorted(names, reverse=True)
+    # "-latest" aliases always point at a current model, so list them first
+    return sorted(names, key=lambda n: (not n.endswith("-latest"), [-ord(c) for c in n]))
 
 
-def _describe_api_error(error):
+def _describe_api_error(error, model_name):
     code = getattr(error, "code", None)
     message = getattr(error, "message", None) or str(error)
     if code in (401, 403) or "API key not valid" in message:
         return "The Google API key was rejected. Check GOOGLE_API_KEY in your .env file (or the app's Secrets when deployed)."
     if code == 404:
-        return f"The selected model is not available: {message}. Choose a different model in the sidebar."
+        return f"The model {model_name} is not available: {message}. Choose a different model in the sidebar."
     if code == 429:
-        return "The Gemini API quota or rate limit was reached. Wait a moment and try again."
+        if re.search(r"limit:\s*0\b", message):
+            return (f"Your API key has no free quota for {model_name}. Pick another model in the sidebar, "
+                    "or enable billing in Google AI Studio.")
+        if re.search(r"per ?day", message, re.IGNORECASE):
+            return (f"Your daily free quota for {model_name} is used up. It resets at midnight Pacific time. "
+                    "Each model has its own quota, so another model in the sidebar may still work.")
+        wait = re.search(r"retry in ([\d.]+)s", message, re.IGNORECASE)
+        wait_text = f"about {round(float(wait.group(1)))} seconds" if wait else "a minute"
+        return (f"Too many requests to {model_name} in a short time (free-tier rate limit). "
+                f"Wait {wait_text} and try again.")
     if code in (500, 502, 503, 504):
         return ("The selected Gemini model is busy right now (a temporary problem on Google's side). "
                 "Try again in a minute, or pick a different model in the sidebar.")
@@ -371,18 +386,31 @@ def call_gemini(prompt, model_name, json_output=False):
         raise GeminiError("No Google API key configured. Add GOOGLE_API_KEY to your .env file (or the app's Secrets when deployed).")
 
     config = types.GenerateContentConfig(response_mime_type="application/json") if json_output else None
-    try:
-        response = get_client(api_key).models.generate_content(
-            model=model_name.removeprefix("models/"),
-            contents=prompt,
-            config=config
-        )
-    except genai_errors.APIError as e:
-        raise GeminiError(_describe_api_error(e)) from e
-    except requests.exceptions.RequestException as e:
-        raise GeminiError(f"Could not reach the Gemini API: {e}") from e
-    except Exception as e:
-        raise GeminiError(f"Unexpected error calling the Gemini API: {e}") from e
+    model_name = model_name.removeprefix("models/")
+    candidates = [model_name] + [m for m in FALLBACK_MODELS if m != model_name]
+    first_error = None
+    for candidate in candidates:
+        try:
+            response = get_client(api_key).models.generate_content(
+                model=candidate, contents=prompt, config=config
+            )
+        except genai_errors.APIError as e:
+            # Out of quota, overloaded, or unavailable: try the next model
+            if getattr(e, "code", None) in (404, 429, 500, 502, 503, 504):
+                first_error = first_error or e
+                continue
+            raise GeminiError(_describe_api_error(e, candidate)) from e
+        except Exception as e:
+            raise GeminiError(f"Could not reach the Gemini API: {e}") from e
+        if candidate != model_name:
+            st.toast(f"{model_name} was unavailable, so {candidate} was used instead.")
+        break
+    else:
+        message = _describe_api_error(first_error, model_name)
+        if len(candidates) > 1:
+            message += (f" The backup models ({', '.join(candidates[1:])}) were unavailable too, so this is "
+                        "most likely a limit on your API key rather than on one model.")
+        raise GeminiError(message) from first_error
 
     text = response.text
     if not text or not text.strip():
