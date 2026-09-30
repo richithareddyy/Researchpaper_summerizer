@@ -8,7 +8,7 @@ __pycache__/
 .venv/
 venv/
 
-# Old export folder (exports are now served directly as downloads)
+# Old export folder (exports are served directly as downloads)
 downloads/
 
 # OS
