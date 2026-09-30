@@ -28,7 +28,7 @@ Turn a PDF, pasted text or DOI/arXiv link into structured summaries, methodology
   - Paste text
   - Upload several PDFs and compare them, or load two sample papers to compare
   - Look up a paper by DOI or arXiv ID/URL. arXiv papers are downloaded in full. For other
-    DOIs the app uses the open-access PDF when Crossref lists one, and otherwise the abstract.
+    DOIs the app uses an open-access PDF from Crossref or Semantic Scholar when one exists, and otherwise the abstract.
 - **Summaries**: comprehensive, executive, technical, critique, or "explain like I'm 5", shown as they are written
 - **Detailed analysis**: methodology, literature context, future research, and practical applications
 - **Follow-up questions**: research questions the paper raises
@@ -86,6 +86,7 @@ Set these in `.env`. Only `GOOGLE_API_KEY` is required.
 | `MAX_INPUT_CHARS` | `400000` | Maximum characters of paper text sent to the model |
 | `MAX_DOWNLOAD_MB` | `50` | Size limit for PDFs downloaded during DOI/arXiv lookup |
 | `CROSSREF_MAILTO` | — | Optional contact email sent to Crossref/arXiv, as their API etiquette asks |
+| `SEMANTIC_SCHOLAR_API_KEY` | — | Optional key for Semantic Scholar, used when Crossref has no abstract or open PDF for a DOI |
 
 For Streamlit Community Cloud, put `GOOGLE_API_KEY` in the app's secrets instead of `.env`.
 

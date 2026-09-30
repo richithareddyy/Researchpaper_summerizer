@@ -229,6 +229,8 @@ st.markdown(f"""
         border-color: var(--rp-ink); color: var(--rp-ink); }}
     [data-testid="stBaseButton-tertiary"]:hover {{ color: var(--rp-accent); }}
     button:disabled {{ cursor: not-allowed; }}
+    /* Streamlit's "Press Enter to submit form" hint overlaps long DOIs; the caption says it instead */
+    [data-testid="InputInstructions"] {{ display: none; }}
     [class*="st-key-link-"] button {{ color: var(--rp-accent); padding-left: 0; }}
     [class*="st-key-link-"] button p {{ white-space: normal; text-align: left; }}
     [class*="st-key-link-"] button:hover {{ text-decoration: underline; }}
@@ -242,6 +244,9 @@ st.markdown(f"""
         border-radius: 3px !important; font-weight: 500; }}
     [data-baseweb="tag"] svg, [data-testid="stMultiSelectTagsContainer"] [data-tag] svg {{
         fill: var(--rp-muted) !important; color: var(--rp-muted) !important; }}
+
+    /* Segmented switchers wrap in narrow columns instead of clipping */
+    [data-testid="stButtonGroup"] > div {{ flex-wrap: wrap; }}
 
     [data-baseweb="tab"] {{ font-weight: 500; transition: color var(--rp-ease); }}
     [data-baseweb="tab"]:hover {{ color: var(--rp-ink); }}
@@ -315,8 +320,11 @@ def render_paper_head():
     if metadata.get("doi"):
         doi = html.escape(metadata["doi"])
         details.append(f'<a href="https://doi.org/{doi}" target="_blank">doi:{doi}</a>')
-    counts = (f"{len(st.session_state.extracted_text.split()):,} words · {len(st.session_state.figures)} figures · "
-              f"{len(st.session_state.tables)} tables · {len(st.session_state.references)} references")
+    counts = f"{len(st.session_state.extracted_text.split()):,} words"
+    for label, items in (("figures", st.session_state.figures), ("tables", st.session_state.tables),
+                         ("references", st.session_state.references)):
+        if items:
+            counts += f" · {len(items)} {label}"
     st.markdown(
         f'<div class="paper-head"><div class="paper-title">{html.escape(title)}</div>'
         + (f'<div class="paper-byline">{html.escape(byline)}</div>' if byline else "")
@@ -1229,6 +1237,32 @@ def fetch_crossref_record(doi):
     return metadata, record
 
 
+def fetch_semantic_scholar_record(doi):
+    """Title, authors, abstract, and any open PDF from Semantic Scholar, or None if unavailable."""
+    headers = _http_headers()
+    if os.getenv("SEMANTIC_SCHOLAR_API_KEY"):
+        headers["x-api-key"] = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
+    try:
+        response = requests.get(
+            f"https://api.semanticscholar.org/graph/v1/paper/DOI:{quote(doi)}",
+            params={"fields": "title,abstract,authors,year,venue,openAccessPdf"},
+            headers=headers, timeout=REQUEST_TIMEOUT
+        )
+        if not response.ok:  # not found, or the shared rate limit was hit
+            return None
+        data = response.json()
+    except (requests.exceptions.RequestException, ValueError):
+        return None
+    return {
+        "title": data.get("title"),
+        "authors": [a.get("name") for a in data.get("authors") or [] if a.get("name")],
+        "publication_year": data.get("year"),
+        "journal_or_conference": data.get("venue") or None,
+        "abstract": (data.get("abstract") or "").strip(),
+        "pdf_url": (data.get("openAccessPdf") or {}).get("url") or None,
+    }
+
+
 def fetch_arxiv_metadata(arxiv_id):
     """Title, authors and year from the arXiv API."""
     response = requests.get("https://export.arxiv.org/api/query", params={"id_list": arxiv_id},
@@ -1286,27 +1320,51 @@ def lookup_paper(identifier):
     if not doi_match:
         raise PaperLookupError("That does not look like a DOI (10.xxxx/...) or an arXiv ID (e.g. 1706.03762).")
     doi = doi_match.group(1).rstrip(".,;)")
-    metadata, record = fetch_crossref_record(doi)
+    try:
+        metadata, record = fetch_crossref_record(doi)
+        crossref_error = None
+    except PaperLookupError as e:
+        # Not every DOI is registered with Crossref; Semantic Scholar may still know it
+        metadata, record, crossref_error = {"doi": doi, "authors": []}, {}, e
+
+    def open_pdf(url, extra_metadata):
+        try:
+            paper = process_pdf(_download(url, accept_pdf_only=True), f"doi:{doi}")
+        except (requests.exceptions.RequestException, PaperLookupError, ValueError):
+            return None
+        paper["metadata"].update({k: v for k, v in extra_metadata.items() if v})
+        return paper
 
     # Prefer an openly available full-text PDF
     for link in record.get("link", []):
         if link.get("content-type") == "application/pdf" and link.get("URL"):
-            try:
-                pdf_bytes = _download(link["URL"], accept_pdf_only=True)
-                paper = process_pdf(pdf_bytes, f"doi:{doi}")
-                paper["metadata"].update({k: v for k, v in metadata.items() if v})
+            paper = open_pdf(link["URL"], metadata)
+            if paper:
                 return paper
-            except (requests.exceptions.RequestException, PaperLookupError, ValueError):
-                continue
 
     abstract = re.sub(r'<[^>]+>', ' ', record.get("abstract") or "")
     abstract = re.sub(r'\s+', ' ', abstract).strip()
+
+    if not abstract:
+        scholar = fetch_semantic_scholar_record(doi)
+        if scholar:
+            for key in ("title", "authors", "publication_year", "journal_or_conference"):
+                if not metadata.get(key):
+                    metadata[key] = scholar[key]
+            if scholar["pdf_url"]:
+                paper = open_pdf(scholar["pdf_url"], metadata)
+                if paper:
+                    return paper
+            abstract = scholar["abstract"]
+        elif crossref_error:
+            raise crossref_error
+
     if not abstract:
         raise PaperLookupError(
-            "Crossref has no open full text or abstract for this DOI. "
-            "Download the PDF from the publisher and use 'Upload PDF' instead."
+            "This paper isn't openly available: there's no free PDF or abstract to work from. "
+            "Download the PDF from the publisher and add it with the PDF option."
         )
-    text = f"{metadata['title'] or ''}\n\n{', '.join(metadata['authors'])}\n\nAbstract\n{abstract}"
+    text = f"{metadata.get('title') or ''}\n\n{', '.join(metadata.get('authors') or [])}\n\nAbstract\n{abstract}"
     paper = build_paper(text, metadata, source=f"doi:{doi}")
     paper["abstract_only"] = True
     return paper
@@ -1574,11 +1632,10 @@ def render_input_panel(model_option):
 
     elif upload_option == "DOI / arXiv Lookup":
         with st.form("lookup_form", border=False):
-            col1, col2 = st.columns([3, 1], vertical_alignment="bottom")
-            identifier = col1.text_input("DOI or arXiv ID/URL", placeholder="1706.03762 or 10.7717/peerj.4375")
-            submitted = col2.form_submit_button("Look Up Paper", type="primary", width="stretch")
-        st.caption("arXiv papers load in full. Other DOIs use the open-access PDF when there is one, "
-                   "otherwise the abstract.")
+            identifier = st.text_input("DOI or arXiv ID/URL", placeholder="1706.03762 or 10.7717/peerj.4375")
+            submitted = st.form_submit_button("Look up", type="primary")
+        st.caption("arXiv papers load in full. Other DOIs use an open-access PDF when one exists, "
+                   "otherwise the abstract. Press Enter or click Look up.")
         if submitted:
             with st.spinner("Looking up the paper..."):
                 try:
