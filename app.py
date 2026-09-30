@@ -28,6 +28,7 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ct
 load_dotenv()
 
 APP_TITLE = "Advanced Research Paper Summarizer"
+CHART_COLOR = "#4F46E5"  # matches primaryColor in .streamlit/config.toml
 
 # Configuration (override any of these in .env)
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
@@ -127,7 +128,9 @@ for _key, _value in SESSION_DEFAULTS.items():
 # Custom CSS
 st.markdown("""
 <style>
-    .main-header {color: #1E88E5; font-size: 40px; font-weight: bold; margin-bottom: 20px; text-align: center;}
+    .main-header {font-size: 40px; font-weight: 800; margin-bottom: 20px; text-align: center;
+                  background: linear-gradient(90deg, #4F46E5, #0EA5E9);
+                  -webkit-background-clip: text; background-clip: text; color: transparent;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1559,7 +1562,8 @@ def render_output_panel(model_option, summary_type, analysis_options):
                     y=[word for word, _ in top],
                     orientation='h',
                     title="Top Keywords by TF-IDF Score",
-                    labels={"x": "Relative Importance", "y": ""}
+                    labels={"x": "Relative Importance", "y": ""},
+                    color_discrete_sequence=[CHART_COLOR]
                 )
                 fig.update_layout(height=500, yaxis={"autorange": "reversed"})
                 st.plotly_chart(fig, width="stretch")
@@ -1575,7 +1579,8 @@ def render_output_panel(model_option, summary_type, analysis_options):
                     x=[year for year, _ in citation_data],
                     y=[count for _, count in citation_data],
                     title="Citations by Publication Year",
-                    labels={"x": "Year", "y": "Number of Citations"}
+                    labels={"x": "Year", "y": "Number of Citations"},
+                    color_discrete_sequence=[CHART_COLOR]
                 )
                 st.plotly_chart(fig, width="stretch")
             else:
